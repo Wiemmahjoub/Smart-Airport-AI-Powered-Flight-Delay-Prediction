@@ -2,6 +2,14 @@ import pandas as pd
 import dash
 from dash import dcc, html
 import plotly.express as px
+import pandas as pd
+
+# Load the flights CSV
+flights = pd.read_csv("Data/flights.csv")
+
+# Show the first 5 rows to check
+print(flights.head())
+
 
 # Load data
 df = pd.read_csv("data/flights.csv")
