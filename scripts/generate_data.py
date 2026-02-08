@@ -1,61 +1,47 @@
 import pandas as pd
 import random
-from faker import Faker
-from datetime import datetime, timedelta
 
-fake = Faker()
+# Load passenger flow data
+flow = pd.read_csv("data/raw/passenger_flow.csv")
 
-# ---------- SETTINGS ----------
-AIRLINES = ["TunisAir", "Qatar Airways", "Emirates", "Lufthansa", "Air France"]
-TERMINALS = ["T1", "T2", "T3"]
-WEATHER = ["Clear", "Rain", "Storm"]
-DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-
-NUM_FLIGHTS = 200
-NUM_PASSENGER_RECORDS = 1000
-
-# ---------- FLIGHTS DATA ----------
-flights = []
-
-for i in range(NUM_FLIGHTS):
-    terminal = random.choice(TERMINALS)
-    gate = f"G{random.randint(1,10)}"
-    dep_time = fake.date_time_this_month()
-    arr_time = dep_time + timedelta(hours=random.randint(1,6))
-    delay = max(0, int(random.gauss(20, 25)))
-
-    flights.append({
-        "flight_id": f"FL{i+1000}",
-        "airline": random.choice(AIRLINES),
-        "terminal": terminal,
-        "gate": gate,
-        "departure_time": dep_time,
-        "arrival_time": arr_time,
-        "day_of_week": random.choice(DAYS),
-        "weather": random.choice(WEATHER),
-        "delay_minutes": delay
-    })
-
-df_flights = pd.DataFrame(flights)
-df_flights.to_csv("data/raw/flights.csv", index=False)
-
-# ---------- PASSENGER FLOW ----------
 passengers = []
+baggage = []
 
-start_time = datetime.now() - timedelta(days=3)
+p_id = 1
+b_id = 1
 
-for _ in range(NUM_PASSENGER_RECORDS):
-    time = start_time + timedelta(minutes=random.randint(0, 4320))
+for _, row in flow.iterrows():
+    count = int(row["passenger_count"])
 
-    passengers.append({
-        "timestamp": time,
-        "terminal": random.choice(TERMINALS),
-        "gate": f"G{random.randint(1,10)}",
-        "passenger_count": random.randint(20, 300),
-        "security_queue": random.randint(5, 120)
-    })
+    for _ in range(count):
+        passenger_id = f"P{p_id:05d}"
+        baggage_id = f"B{b_id:05d}"
 
-df_passengers = pd.DataFrame(passengers)
-df_passengers.to_csv("data/raw/passenger_flow.csv", index=False)
+        # Passenger record
+        passengers.append({
+            "passenger_id": passenger_id,
+            "terminal": row["terminal"],
+            "gate": row["gate"],
+            "timestamp": row["timestamp"]
+        })
 
-print("✅ Data generated successfully!")
+        # Baggage record
+        status = random.choices(
+            ["delivered", "delayed", "lost"],
+            weights=[85, 10, 5]
+        )[0]
+
+        baggage.append({
+            "baggage_id": baggage_id,
+            "passenger_id": passenger_id,
+            "status": status
+        })
+
+        p_id += 1
+        b_id += 1
+
+# Save generated data
+pd.DataFrame(passengers).to_csv("data/raw/passengers.csv", index=False)
+pd.DataFrame(baggage).to_csv("data/raw/baggage.csv", index=False)
+
+print("✅ passengers.csv and baggage.csv generated successfully")
