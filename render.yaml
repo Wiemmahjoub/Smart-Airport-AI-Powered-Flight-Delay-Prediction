@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: aoip-app
+    runtime: docker
+    repo: https://github.com/yourusername/your-repo
+    branch: main
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /_health
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
