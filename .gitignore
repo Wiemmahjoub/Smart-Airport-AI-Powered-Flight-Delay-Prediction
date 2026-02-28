@@ -20,3 +20,5 @@ Thumbs.db
 
 # Data (optional if you have large datasets)
 Data/
+
+model/*.pkl

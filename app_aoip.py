@@ -5,1028 +5,922 @@ import plotly.express as px
 import plotly.graph_objects as go
 import joblib
 import numpy as np
+import httpx
+import os
 from dash.exceptions import PreventUpdate
 from datetime import datetime
 
+API_URL = os.environ.get("API_URL", "http://localhost:8000")
+
 # =========================
-# LOAD DATA & MODEL
+# COLOR PALETTE
+# =========================
+BG_MAIN   = "#0d0f12"
+BG_CARD   = "#161a20"
+BG_PANEL  = "#1c2028"
+BG_NAVBAR = "#0a0c0f"
+BG_INPUT  = "#1e2330"
+TEXT_PRI  = "#c9cdd6"
+TEXT_SEC  = "#6b7280"
+TEXT_HEAD = "#e2e4e9"
+BORDER    = "#252a35"
+ACC_TEAL  = "#4e9e8e"
+ACC_BLUE  = "#4a7fa5"
+ACC_RED   = "#9b4a4a"
+ACC_PURP  = "#6a4e8a"
+ACC_AMBER = "#a07a3a"
+ACC_GREEN = "#3d7a5c"
+ACC_CYAN  = "#2e8b9a"
+
+# =========================
+# LOAD DATA
 # =========================
 print("Loading data and models...")
 
 try:
     df_flights = pd.read_csv("data/processed/flights_clean.csv")
     df_flights.columns = df_flights.columns.str.lower().str.strip()
-    
-    # Create additional features
-    if 'departure_time' in df_flights.columns:
-        df_flights['departure_time'] = pd.to_datetime(df_flights['departure_time'])
-        df_flights['departure_hour'] = df_flights['departure_time'].dt.hour
-        df_flights['departure_day'] = df_flights['departure_time'].dt.day_name()
-    
-    # Add delay risk categorization
+    # Only parse departure_time if it actually has values
+    if 'departure_time' in df_flights.columns and df_flights['departure_time'].notna().any():
+        df_flights['departure_time'] = pd.to_datetime(df_flights['departure_time'], errors='coerce')
+        df_flights['departure_hour'] = df_flights['departure_time'].dt.hour.astype('Int64')
+        df_flights['departure_day']  = df_flights['departure_time'].dt.day_name()
+    # Only generate random hours if column truly missing
+    if 'departure_hour' not in df_flights.columns:
+        np.random.seed(42)
+        df_flights['departure_hour'] = np.random.randint(0, 24, size=len(df_flights))
     if 'delay_minutes' in df_flights.columns:
-        def categorize_risk(delay):
-            if delay <= 15: return "Low"
-            elif delay <= 30: return "Medium"
-            else: return "High"
-        df_flights['delay_risk'] = df_flights['delay_minutes'].apply(categorize_risk)
-    
+        df_flights['delay_risk'] = df_flights['delay_minutes'].apply(
+            lambda d: 'Low' if d <= 15 else 'Medium' if d <= 30 else 'High'
+        )
     print(f"✓ Loaded {len(df_flights)} flight records")
-    
 except Exception as e:
     print(f"✗ Error loading flights: {e}")
     df_flights = pd.DataFrame()
 
-# Load passenger data
 try:
     df_passengers = pd.read_csv("data/processed/passenger_flow_clean.csv")
     df_passengers.columns = df_passengers.columns.str.lower().str.strip()
-    print(f"✓ Loaded passenger flow data")
+    if 'timestamp' in df_passengers.columns and 'hour' not in df_passengers.columns:
+        df_passengers['timestamp'] = pd.to_datetime(df_passengers['timestamp'], errors='coerce')
+        df_passengers['hour'] = df_passengers['timestamp'].dt.hour
+    print("✓ Loaded passenger data")
 except:
-    print("✗ No passenger data found, using sample data")
     df_passengers = pd.DataFrame()
+    print("✗ No passenger data, using sample")
 
-# Load model
 try:
-    model = joblib.load("model/delay_model.pkl")
-    print("✓ ML model loaded")
+    delay_model  = joblib.load("model/delay_model.pkl")
+    le_airline   = joblib.load("model/le_airline.pkl")
+    le_weather   = joblib.load("model/le_weather.pkl")
+    le_terminal  = joblib.load("model/le_terminal.pkl")
+    print("✓ Local ML models loaded")
 except:
-    model = None
-    print("⚠ Using sample predictions (no model found)")
+    delay_model = le_airline = le_weather = le_terminal = None
+    print("⚠ Local ML models not found")
+
+try:
+    weather_model = joblib.load("model/weather_delay_model.pkl")
+    print("✓ Weather ML model loaded")
+except:
+    weather_model = None
+
+try:
+    from alerts import AOIPAlertSystem
+    alert_system = AOIPAlertSystem()
+    print("✓ Alert system loaded")
+except:
+    alert_system = None
+    print("⚠ Alert system not found")
+
 
 # =========================
-# AOIP MODULES
+# MODULES
 # =========================
 class PassengerFlowIntelligence:
-    """AI Module 1: Passenger Flow & Congestion Prediction"""
-    
     def __init__(self):
-        self.data = self.load_or_create_data()
-        
-    def load_or_create_data(self):
-        """Load real data or create realistic sample"""
-        if not df_passengers.empty:
+        self.data = self._load_or_create()
+
+    def _load_or_create(self):
+        if not df_passengers.empty and 'hour' in df_passengers.columns:
             return df_passengers
-        
-        # Create realistic sample data
         np.random.seed(42)
-        hours = list(range(24))
-        gates = [f'G{i}' for i in range(1, 16)]
-        terminals = ['T1', 'T2', 'T3']
-        
         data = []
-        for hour in hours:
-            for terminal in terminals:
-                for gate in gates[:5]:  # 5 gates per terminal
-                    # Peak hours: 6-9 AM, 4-7 PM
-                    if hour in range(6, 10) or hour in range(16, 19):
-                        passengers = np.random.randint(80, 200)
-                        congestion = np.random.randint(60, 90)
-                    else:
-                        passengers = np.random.randint(10, 60)
-                        congestion = np.random.randint(10, 40)
-                    
+        for hour in range(24):
+            for terminal in ['T1', 'T2', 'T3']:
+                for g in range(1, 6):
+                    peak = hour in range(6, 10) or hour in range(16, 19)
                     data.append({
-                        'hour': hour,
-                        'terminal': terminal,
-                        'gate': f"{terminal}-{gate}",
-                        'passenger_count': passengers,
-                        'congestion_level': congestion,
+                        'hour': hour, 'terminal': terminal,
+                        'gate': f"{terminal}-G{g}",
+                        'passenger_count': np.random.randint(80, 200) if peak else np.random.randint(10, 60),
+                        'congestion_level': np.random.randint(60, 90) if peak else np.random.randint(10, 40),
                         'wait_time': np.random.randint(5, 30)
                     })
-        
         return pd.DataFrame(data)
-    
+
     def get_heatmap(self, terminal="All"):
-        """Generate interactive passenger flow heatmap"""
         df = self.data.copy()
         if terminal != "All":
             df = df[df['terminal'] == terminal]
-        
+        if 'hour' not in df.columns:
+            df = self._load_or_create()
+            if terminal != "All":
+                df = df[df['terminal'] == terminal]
+        if 'gate' not in df.columns:
+            df['gate'] = 'G1'
         fig = px.density_heatmap(
             df, x='hour', y='gate', z='passenger_count',
-            title=f'Passenger Flow Heatmap - {terminal}',
-            color_continuous_scale='Viridis',
+            title=f'Passenger Flow Heatmap — {terminal}',
+            color_continuous_scale='Cividis',
             labels={'hour': 'Hour of Day', 'gate': 'Gate', 'passenger_count': 'Passengers'}
         )
-        
-        fig.update_layout(height=500)
+        fig.update_layout(height=500, paper_bgcolor=BG_CARD, plot_bgcolor=BG_PANEL, font_color=TEXT_PRI)
         return fig
-    
-    def get_congestion_predictions(self, hours_ahead=3):
-        """Predict congestion for next X hours"""
-        predictions = []
-        current_hour = datetime.now().hour
-        
-        for i in range(hours_ahead):
-            hour = (current_hour + i) % 24
-            hour_data = self.data[self.data['hour'] == hour]
-            
-            if not hour_data.empty:
-                avg_congestion = hour_data['congestion_level'].mean()
-                risk = "High" if avg_congestion > 70 else "Medium" if avg_congestion > 40 else "Low"
-                
-                predictions.append({
-                    'hour': f"{hour:02d}:00",
-                    'congestion': f"{avg_congestion:.0f}%",
-                    'risk': risk,
-                    'recommendation': self.get_recommendation(avg_congestion)
-                })
-        
-        return predictions
-    
-    def get_recommendation(self, congestion_level):
-        """Get staffing recommendations based on congestion"""
-        if congestion_level > 70:
-            return "Add 3 security staff, open extra lanes"
-        elif congestion_level > 50:
-            return "Add 2 staff, monitor queues"
-        else:
-            return "Normal staffing sufficient"
+
 
 class GateOptimizationEngine:
-    """AI Module 2: Gate Assignment & Resource Optimization"""
-    
     def __init__(self):
-        self.flights = self.load_or_create_flight_data()
-        
-    def load_or_create_flight_data(self):
-        """Load flight data or create realistic sample"""
-        if not df_flights.empty:
-            return df_flights
-        
-        # Create sample flight data
+        self.flights = df_flights if not df_flights.empty else self._create_sample()
+
+    def _create_sample(self):
         np.random.seed(42)
-        airlines = ['Air France', 'Emirates', 'Lufthansa', 'Qatar Airways', 'TunisAir']
-        gates = [f'T{i}-G{j}' for i in range(1, 4) for j in range(1, 6)]
-        
+        airlines = ['TunisAir', 'Air France', 'Emirates', 'Lufthansa', 'Qatar Airways']
+        gates    = [f'T{i}-G{j}' for i in range(1, 4) for j in range(1, 6)]
+        base     = {'TunisAir': (45, 120), 'Air France': (20, 60),
+                    'Lufthansa': (15, 45), 'Emirates': (10, 35), 'Qatar Airways': (5, 25)}
         data = []
-        for i in range(200):
-            airline = np.random.choice(airlines)
-            gate = np.random.choice(gates)
-            
-            # Different airlines have different delay patterns
-            if airline == 'Qatar Airways':
-                delay = np.random.randint(20, 60)
-            elif airline == 'Emirates':
-                delay = np.random.randint(10, 40)
-            else:
-                delay = np.random.randint(0, 30)
-            
-            data.append({
-                'flight_id': f'{airline[:2].upper()}{i:03d}',
-                'airline': airline,
-                'terminal': gate.split('-')[0],
-                'gate': gate,
-                'delay_minutes': delay,
-                'status': 'On Time' if delay < 15 else 'Delayed'
-            })
-        
+        for i in range(500):
+            a = np.random.choice(airlines)
+            g = np.random.choice(gates)
+            lo, hi = base[a]
+            data.append({'flight_id': f'FL{i}', 'airline': a,
+                         'terminal': g.split('-')[0], 'gate': g,
+                         'delay_minutes': np.random.randint(lo, hi), 'status': 'Delayed'})
         return pd.DataFrame(data)
-    
+
     def analyze_gate_performance(self):
-        """Analyze gate efficiency and utilization"""
-        gate_stats = self.flights.groupby('gate').agg({
-            'flight_id': 'count',
-            'delay_minutes': 'mean',
-            'airline': lambda x: ', '.join(x.unique()[:2])  # Top airlines
-        }).rename(columns={'flight_id': 'flight_count', 'delay_minutes': 'avg_delay'})
-        
-        gate_stats['utilization'] = (gate_stats['flight_count'] / gate_stats['flight_count'].max() * 100).round(1)
-        gate_stats['efficiency'] = (100 - gate_stats['avg_delay']).clip(0, 100).round(1)
-        
-        return gate_stats.sort_values('efficiency', ascending=False)
-    
+        gs = self.flights.groupby('gate').agg(
+            flight_count=('flight_id', 'count'),
+            avg_delay=('delay_minutes', 'mean')
+        )
+        gs['utilization'] = (gs['flight_count'] / gs['flight_count'].max() * 100).round(1)
+        gs['efficiency']  = (100 - gs['avg_delay']).clip(0, 100).round(1)
+        return gs.sort_values('efficiency', ascending=False)
+
     def get_optimization_suggestions(self):
-        """Get AI-powered optimization suggestions"""
-        gate_stats = self.analyze_gate_performance()
+        gs = self.analyze_gate_performance()
         suggestions = []
-        
-        # Find worst performing gates
-        worst_gates = gate_stats[gate_stats['efficiency'] < 60].head(2)
-        best_gates = gate_stats[gate_stats['efficiency'] > 85].head(2)
-        
-        for idx, (gate, stats) in enumerate(worst_gates.iterrows()):
-            if idx < len(best_gates.index):
-                best_gate = best_gates.index[idx]
+        worst = gs[gs['efficiency'] < 60].head(2)
+        best  = gs[gs['efficiency'] > 85].head(2)
+        for idx, (gate, stats) in enumerate(worst.iterrows()):
+            if idx < len(best.index):
                 suggestions.append({
-                    'action': f'🔀 Reassign flights from {gate} to {best_gate}',
-                    'reason': f'{gate} has {stats["avg_delay"]:.1f} min avg delay (efficiency: {stats["efficiency"]}%)',
-                    'impact': 'Expected 25-40% delay reduction',
+                    'action':   f'🔀 Reassign flights from {gate} to {best.index[idx]}',
+                    'reason':   f'{gate} has {stats["avg_delay"]:.1f} min avg delay',
+                    'impact':   'Expected 25–40% delay reduction',
                     'priority': 'HIGH' if stats['efficiency'] < 50 else 'MEDIUM'
                 })
-        
-        # Add generic recommendations
-        if len(suggestions) < 3:
-            suggestions.extend([
-                {
-                    'action': '📊 Implement dynamic gate assignment',
-                    'reason': 'Current static assignment causes bottlenecks',
-                    'impact': 'Improve utilization by 15-20%',
-                    'priority': 'MEDIUM'
-                },
-                {
-                    'action': '🕒 Stagger flight schedules at peak gates',
-                    'reason': 'Gates T1-G1, T2-G1 are overloaded 8-10 AM',
-                    'impact': 'Reduce congestion by 30%',
-                    'priority': 'HIGH'
-                }
-            ])
-        
-        return suggestions[:5]
-    
-    def get_gate_utilization_chart(self):
-        """Create gate utilization visualization"""
-        gate_stats = self.analyze_gate_performance()
-        
-        fig = go.Figure(data=[
-            go.Bar(
-                name='Utilization %',
-                x=gate_stats.index,
-                y=gate_stats['utilization'],
-                marker_color='#3498db'
-            ),
-            go.Scatter(
-                name='Efficiency %',
-                x=gate_stats.index,
-                y=gate_stats['efficiency'],
-                mode='lines+markers',
-                yaxis='y2',
-                line=dict(color='#2ecc71', width=3)
-            )
+        suggestions.extend([
+            {'action': '📊 Implement dynamic gate assignment',
+             'reason': 'Static assignment causes bottlenecks',
+             'impact': 'Improve utilization by 15–20%', 'priority': 'MEDIUM'},
+            {'action': '🕒 Stagger schedules at peak gates',
+             'reason': 'T1-G1 and T2-G1 overloaded 8–10 AM',
+             'impact': 'Reduce congestion by 30%', 'priority': 'HIGH'}
         ])
-        
+        return suggestions[:5]
+
+    def get_gate_utilization_chart(self):
+        gs = self.analyze_gate_performance()
+        fig = go.Figure(data=[
+            go.Bar(name='Utilization %', x=gs.index, y=gs['utilization'], marker_color=ACC_BLUE),
+            go.Scatter(name='Efficiency %', x=gs.index, y=gs['efficiency'],
+                       mode='lines+markers', yaxis='y2', line=dict(color=ACC_TEAL, width=2))
+        ])
         fig.update_layout(
-            title='Gate Performance Metrics',
-            xaxis_title='Gate',
-            yaxis_title='Utilization (%)',
-            yaxis2=dict(
-                title='Efficiency (%)',
-                overlaying='y',
-                side='right',
-                range=[0, 100]
-            ),
-            height=400,
-            showlegend=True,
-            hovermode='x unified'
+            title='Gate Performance Metrics', xaxis_title='Gate', yaxis_title='Utilization (%)',
+            yaxis2=dict(title='Efficiency (%)', overlaying='y', side='right', range=[0, 100]),
+            height=400, showlegend=True, hovermode='x unified',
+            paper_bgcolor=BG_CARD, plot_bgcolor=BG_PANEL, font_color=TEXT_PRI
         )
-        
         return fig
 
+
 class OperationalRiskScorer:
-    """AI Module 3: Multi-factor Risk Assessment"""
-    
-    def __init__(self):
-        self.risk_factors = ['delays', 'congestion', 'weather', 'time_of_day']
-        
     def calculate_risk_score(self, terminal, hour, weather="Clear"):
-        """Calculate comprehensive risk score (0-100)"""
-        base_score = 50
-        
-        # Delay factor (from flight data)
         if not df_flights.empty:
-            terminal_delays = df_flights[df_flights['terminal'] == terminal]['delay_minutes'].mean()
-            delay_factor = min(terminal_delays / 60 * 100, 100) if not pd.isna(terminal_delays) else 30
+            t_data = df_flights[df_flights['terminal'] == terminal]
+            delay_factor = min(t_data['delay_minutes'].mean() * 2, 100) if not t_data.empty else 30
         else:
             delay_factor = 30
-        
-        # Congestion factor (peak hours)
-        if hour in range(7, 10) or hour in range(17, 20):
-            congestion_factor = 70
-        elif hour in range(10, 17):
-            congestion_factor = 40
-        else:
-            congestion_factor = 20
-        
-        # Weather factor
-        weather_factor = {
-            'Clear': 20,
-            'Cloudy': 40,
-            'Rain': 70,
-            'Storm': 90
-        }.get(weather, 50)
-        
-        # Calculate weighted score
-        weights = {'delays': 0.4, 'congestion': 0.3, 'weather': 0.2, 'time_of_day': 0.1}
-        total_score = (
-            delay_factor * weights['delays'] +
-            congestion_factor * weights['congestion'] +
-            weather_factor * weights['weather'] +
-            (100 if hour in [6, 7, 8, 17, 18] else 30) * weights['time_of_day']
-        )
-        
-        return min(total_score, 100)
-    
-    def get_risk_analysis(self, terminal="T1"):
-        """Get detailed risk analysis for a terminal"""
-        current_hour = datetime.now().hour
-        risk_score = self.calculate_risk_score(terminal, current_hour)
-        
-        if risk_score < 40:
-            level = "LOW"
-            color = "#27ae60"
-            actions = ["Normal operations", "Monitor standard metrics"]
-        elif risk_score < 70:
-            level = "MEDIUM"
-            color = "#f39c12"
-            actions = ["Increase monitoring", "Prepare backup staff", "Review schedules"]
-        else:
-            level = "HIGH"
-            color = "#e74c3c"
-            actions = ["Activate contingency plan", "Deploy extra staff", "Notify airlines", "Consider delays"]
-        
-        return {
-            'score': risk_score,
-            'level': level,
-            'color': color,
-            'actions': actions,
-            'factors': [
-                f"Current hour: {current_hour}:00",
-                f"Terminal: {terminal}",
-                f"Peak hours: {current_hour in [7,8,9,17,18,19]}"
-            ]
-        }
+        peak_factor    = 70 if hour in range(7, 10) or hour in range(17, 20) else 30
+        weather_factor = {'Clear': 20, 'Cloudy': 40, 'Rain': 65, 'Storm': 85}.get(weather, 40)
+        weekend_factor = 40 if datetime.now().weekday() >= 5 else 20
+        return min(delay_factor * 0.40 + peak_factor * 0.25 +
+                   weather_factor * 0.25 + weekend_factor * 0.10, 100)
 
-# Initialize AOIP modules
-print("Initializing AOIP modules...")
+
 passenger_ai = PassengerFlowIntelligence()
-gate_ai = GateOptimizationEngine()
-risk_ai = OperationalRiskScorer()
+gate_ai      = GateOptimizationEngine()
+risk_ai      = OperationalRiskScorer()
 print("✓ AOIP modules ready")
+
+total_flights = len(df_flights)
+avg_delay     = round(df_flights['delay_minutes'].mean(), 1) if not df_flights.empty else 0
+high_risk     = len(df_flights[df_flights['delay_risk'] == 'High']) if not df_flights.empty else 0
+on_time_pct   = round((df_flights['delay_minutes'] <= 15).mean() * 100, 1) if not df_flights.empty else 0
 
 # =========================
 # DASH APP
 # =========================
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
-app.title = "Airport Operations Intelligence Platform (AOIP)"
+app.title = "AOIP — Airport Operations Intelligence Platform"
 
-# Custom CSS
-app.index_string = '''
+app.index_string = f'''
 <!DOCTYPE html>
 <html>
     <head>
-        {%metas%}
-        <title>{%title%}</title>
-        {%favicon%}
-        {%css%}
+        {{%metas%}}
+        <title>{{%title%}}</title>
+        {{%favicon%}}
+        {{%css%}}
         <style>
-            * { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-            body { margin: 0; padding: 0; background: #f8f9fa; }
-            .nav-bar { 
-                background: linear-gradient(135deg, #1a2980, #26d0ce);
-                padding: 15px 30px; 
-                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            }
-            .nav-link { 
-                color: white; text-decoration: none; margin: 0 15px; 
-                font-weight: 500; padding: 8px 16px; border-radius: 4px;
-                transition: all 0.3s;
-            }
-            .nav-link:hover { background: rgba(255,255,255,0.2); }
-            .kpi-card { 
-                background: white; padding: 20px; border-radius: 10px; 
-                box-shadow: 0 2px 5px rgba(0,0,0,0.05); text-align: center;
-                transition: transform 0.3s;
-            }
-            .kpi-card:hover { transform: translateY(-5px); }
-            .module-card { 
-                background: white; padding: 25px; border-radius: 10px; 
-                box-shadow: 0 3px 15px rgba(0,0,0,0.08); margin: 15px 0;
-                border-left: 5px solid #3498db;
-            }
-            .risk-high { background: #fdeaea; border-left-color: #e74c3c; }
-            .risk-medium { background: #fef5e7; border-left-color: #f39c12; }
-            .risk-low { background: #e8f6f3; border-left-color: #27ae60; }
+            * {{ font-family: 'Segoe UI', system-ui, sans-serif; box-sizing: border-box; }}
+            body {{ margin: 0; padding: 0; background: {BG_MAIN}; color: {TEXT_PRI}; }}
+            ::-webkit-scrollbar {{ width: 6px; }}
+            ::-webkit-scrollbar-track {{ background: {BG_MAIN}; }}
+            ::-webkit-scrollbar-thumb {{ background: {BORDER}; border-radius: 3px; }}
+            @keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:0.6; }} }}
+            .alert-pulse {{ animation: pulse 2s infinite; }}
         </style>
     </head>
     <body>
-        {%app_entry%}
-        <footer>{%config%}{%scripts%}{%renderer%}</footer>
+        {{%app_entry%}}
+        <footer>{{%config%}}{{%scripts%}}{{%renderer%}}</footer>
     </body>
 </html>
 '''
 
+PAGE  = {'backgroundColor': BG_MAIN, 'color': TEXT_PRI, 'minHeight': '100vh', 'paddingBottom': '60px'}
+CARD  = {'backgroundColor': BG_CARD, 'border': f'1px solid {BORDER}', 'borderRadius': '8px',
+         'padding': '28px', 'marginBottom': '24px', 'boxShadow': '0 4px 20px rgba(0,0,0,0.5)'}
+PANEL = {'backgroundColor': BG_PANEL, 'border': f'1px solid {BORDER}',
+         'borderRadius': '6px', 'padding': '20px'}
+
+
+def alert_banner(alerts):
+    if not alerts:
+        return html.Div()
+    top   = alerts[0]
+    color = {'CRITICAL': '#7a1a1a', 'HIGH': ACC_RED, 'MEDIUM': ACC_AMBER}.get(top['priority'], ACC_BLUE)
+    return html.Div(className='alert-pulse', style={
+        'backgroundColor': color, 'color': TEXT_HEAD, 'padding': '12px 28px',
+        'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'fontSize': '14px'
+    }, children=[
+        html.Div([html.Strong(f"⚠ {top['priority']}: {top['title']}  "), html.Span(top['message'])]),
+        html.Div(top['details'], style={'color': 'rgba(255,255,255,0.7)', 'fontSize': '12px'})
+    ])
+
+
+def navbar():
+    link = {'color': TEXT_SEC, 'margin': '0 14px', 'textDecoration': 'none', 'fontSize': '14px'}
+    return html.Div(style={
+        'backgroundColor': BG_NAVBAR, 'padding': '14px 28px',
+        'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center',
+        'borderBottom': f'1px solid {BORDER}'
+    }, children=[
+        html.Span("AOIP · Airport Operations Intelligence",
+                  style={'color': TEXT_HEAD, 'fontSize': '16px', 'fontWeight': '600'}),
+        html.Div([
+            dcc.Link("Home",           href="/",           style=link),
+            dcc.Link("Passenger Flow", href="/passenger",  style=link),
+            dcc.Link("Gate Opt.",      href="/gates",      style=link),
+            dcc.Link("Risk",           href="/risk",       style=link),
+            dcc.Link("Prediction",     href="/prediction", style=link),
+            dcc.Link("Forecast",       href="/forecast",   style={**link, 'color': ACC_CYAN}),
+            dcc.Link("Analytics",      href="/analytics",  style=link),
+        ])
+    ])
+
+
+def kpi_card(label, value, color):
+    return html.Div(style={
+        **CARD, 'textAlign': 'center', 'flex': '1',
+        'minWidth': '160px', 'borderTop': f'3px solid {color}', 'marginBottom': '0'
+    }, children=[
+        html.Div(str(value), style={'fontSize': '36px', 'color': color, 'fontWeight': '300'}),
+        html.Div(label, style={'color': TEXT_SEC, 'fontSize': '13px', 'marginTop': '4px'})
+    ])
+
+
 # =========================
-# PAGE LAYOUTS
+# LAYOUTS
 # =========================
 def home_layout():
-    """Main dashboard page"""
-    gate_stats = gate_ai.analyze_gate_performance()
-    risk_analysis = risk_ai.get_risk_analysis("T1")
-    
-    return html.Div([
-        # Navigation
-        html.Div([
-            html.H2("✈️ AIRPORT OPERATIONS INTELLIGENCE PLATFORM", 
-                   style={'color': 'white', 'margin': '0', 'fontSize': '24px'}),
-            html.Div([
-                dcc.Link("🏠 Dashboard", href="/", className="nav-link"),
-                dcc.Link("👥 Passenger Flow", href="/passenger", className="nav-link"),
-                dcc.Link("🚪 Gate Optimization", href="/gates", className="nav-link"),
-                dcc.Link("⚠️ Risk Management", href="/risk", className="nav-link"),
-                dcc.Link("🤖 AI Prediction", href="/prediction", className="nav-link"),
-                dcc.Link("📊 Analytics", href="/analytics", className="nav-link"),
-            ], style={'marginTop': '10px'})
-        ], className="nav-bar"),
-        
-        # KPI Cards
-        html.Div([
-            html.Div([
-                html.H3("Operational Risk", style={'margin': '0', 'color': risk_analysis['color']}),
-                html.H2(f"{risk_analysis['score']:.0f}/100", 
-                       style={'margin': '10px 0', 'fontSize': '36px'}),
-                html.P(risk_analysis['level'], style={'fontWeight': 'bold'})
-            ], className="kpi-card", style={'flex': '1', 'margin': '10px'}),
-            
-            html.Div([
-                html.H3("Gate Efficiency", style={'margin': '0', 'color': '#3498db'}),
-                html.H2(f"{gate_stats['efficiency'].mean():.1f}%", 
-                       style={'margin': '10px 0', 'fontSize': '36px'}),
-                html.P("Average across all gates")
-            ], className="kpi-card", style={'flex': '1', 'margin': '10px'}),
-            
-            html.Div([
-                html.H3("Flights Today", style={'margin': '0', 'color': '#9b59b6'}),
-                html.H2(f"{len(gate_ai.flights)}", 
-                       style={'margin': '10px 0', 'fontSize': '36px'}),
-                html.P("Total flights monitored")
-            ], className="kpi-card", style={'flex': '1', 'margin': '10px'}),
-            
-            html.Div([
-                html.H3("Avg Delay", style={'margin': '0', 'color': '#e74c3c'}),
-                html.H2(f"{gate_ai.flights['delay_minutes'].mean():.1f} min", 
-                       style={'margin': '10px 0', 'fontSize': '36px'}),
-                html.P("Across all airlines")
-            ], className="kpi-card", style={'flex': '1', 'margin': '10px'}),
-        ], style={'display': 'flex', 'padding': '20px', 'maxWidth': '1400px', 'margin': '0 auto'}),
-        
-        # AOIP Modules Overview
-        html.Div([
-            html.H2("AOIP Intelligence Modules", style={'textAlign': 'center', 'margin': '30px 0'}),
-            
-            html.Div([
-                html.Div([
-                    html.H3("👥 Passenger Flow AI", style={'color': '#3498db'}),
-                    html.P("• Predict congestion 3 hours ahead"),
-                    html.P("• Heatmap visualization"),
-                    html.P("• Staffing recommendations"),
-                    html.P("• Wait time optimization"),
-                    dcc.Link("Explore →", href="/passenger", 
-                            style={'color': '#3498db', 'textDecoration': 'none', 'fontWeight': 'bold'})
-                ], className="module-card", style={'width': '30%'}),
-                
-                html.Div([
-                    html.H3("🚪 Gate Optimization AI", style={'color': '#2ecc71'}),
-                    html.P("• Dynamic gate assignment"),
-                    html.P("• Conflict prediction"),
-                    html.P("• Utilization analytics"),
-                    html.P("• Efficiency scoring"),
-                    dcc.Link("Explore →", href="/gates", 
-                            style={'color': '#2ecc71', 'textDecoration': 'none', 'fontWeight': 'bold'})
-                ], className="module-card", style={'width': '30%'}),
-                
-                html.Div([
-                    html.H3("⚠️ Risk Intelligence", style={'color': '#e74c3c'}),
-                    html.P("• Multi-factor risk scoring"),
-                    html.P("• Early warning system"),
-                    html.P("• Actionable recommendations"),
-                    html.P("• Real-time monitoring"),
-                    dcc.Link("Explore →", href="/risk", 
-                            style={'color': '#e74c3c', 'textDecoration': 'none', 'fontWeight': 'bold'})
-                ], className="module-card", style={'width': '30%'}),
-            ], style={'display': 'flex', 'justifyContent': 'space-between', 'maxWidth': '1400px', 'margin': '0 auto'}),
-        ]),
-        
-        # Current Alerts
-        html.Div([
-            html.H3("🚨 Current Alerts & Recommendations", style={'textAlign': 'center'}),
-            
-            html.Div([
-                html.Div([
-                    html.H4("High Priority"),
-                    html.Ul([
-                        html.Li("Gate T1-G1: 85% utilization, consider redistribution"),
-                        html.Li("Peak hour congestion predicted in 2 hours"),
-                        html.Li("Qatar Airways showing 45min avg delays")
-                    ])
-                ], className="module-card risk-high", style={'width': '48%'}),
-                
-                html.Div([
-                    html.H4("Optimization Opportunities"),
-                    html.Ul([
-                        html.Li("Gate T3-G4 underutilized (35%) - reassign flights"),
-                        html.Li("Add 2 staff at security during 8-10 AM"),
-                        html.Li("Consider staggering Lufthansa departure times")
-                    ])
-                ], className="module-card risk-medium", style={'width': '48%'}),
-            ], style={'display': 'flex', 'justifyContent': 'space-between', 'maxWidth': '1400px', 'margin': '0 auto'}),
-        ], style={'padding': '30px', 'backgroundColor': '#f8f9fa', 'marginTop': '30px'}),
+    alerts = alert_system.check_all_alerts(df_flights, passenger_ai.data, "Clear") if alert_system else []
+    nav_cards = [
+        ("Passenger Flow",    ACC_TEAL,  "/passenger",  "Real-time passenger movement and congestion heatmaps."),
+        ("Gate Optimisation", ACC_BLUE,  "/gates",      "Gate utilisation and AI-driven reassignment suggestions."),
+        ("Risk Management",   ACC_RED,   "/risk",       "Multi-factor operational risk scoring."),
+        ("AI Predictions",    ACC_PURP,  "/prediction", "ML-powered delay forecasting with SHAP explainability."),
+        ("Delay Forecast",    ACC_CYAN,  "/forecast",   "Time-series delay forecast for next 24 hours and 7 days."),
+        ("Analytics",         ACC_AMBER, "/analytics",  "Weather impact and historical delay analytics."),
+    ]
+    return html.Div(style=PAGE, children=[
+        navbar(),
+        alert_banner(alerts),
+        dcc.Interval(id='interval-refresh', interval=60*1000, n_intervals=0),
+        html.Div(style={'padding': '40px', 'maxWidth': '1200px', 'margin': '0 auto'}, children=[
+            html.H1("Airport Operations Intelligence Platform",
+                    style={'color': TEXT_HEAD, 'fontWeight': '300', 'textAlign': 'center', 'marginBottom': '6px'}),
+            html.P("Monitor, analyse, and optimise airport operations in real-time.",
+                   style={'color': TEXT_SEC, 'textAlign': 'center', 'marginBottom': '10px'}),
+            html.P(id='last-refresh',
+                   style={'color': TEXT_SEC, 'textAlign': 'center', 'fontSize': '12px', 'marginBottom': '30px'}),
+            html.Div(style={'display': 'flex', 'gap': '16px', 'flexWrap': 'wrap', 'marginBottom': '40px'}, children=[
+                kpi_card("Total Flights",     total_flights,     ACC_BLUE),
+                kpi_card("Avg Delay (min)",   avg_delay,         ACC_AMBER),
+                kpi_card("High Risk Flights", high_risk,         ACC_RED),
+                kpi_card("On-Time %",         f"{on_time_pct}%", ACC_GREEN),
+            ]),
+            html.Div(style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '20px', 'justifyContent': 'center'},
+                     children=[
+                html.Div(style={
+                    **CARD, 'width': '180px', 'textAlign': 'center',
+                    'borderTop': f'3px solid {color}', 'marginBottom': '0'
+                }, children=[
+                    html.H3(label, style={'color': color, 'fontSize': '14px', 'marginTop': '0'}),
+                    html.P(desc,   style={'color': TEXT_SEC, 'fontSize': '11px', 'lineHeight': '1.5'}),
+                    dcc.Link("Open →", href=href,
+                             style={'color': color, 'textDecoration': 'none', 'fontWeight': '600'})
+                ]) for label, color, href, desc in nav_cards
+            ])
+        ])
     ])
+
 
 def passenger_flow_layout():
-    """Passenger intelligence module"""
-    predictions = passenger_ai.get_congestion_predictions(3)
-    
-    return html.Div([
-        html.Div([
-            html.H2("👥 Passenger Flow Intelligence", 
-                   style={'margin': '0', 'color': '#2c3e50'}),
-            dcc.Link("← Back to Dashboard", href="/", 
-                    style={'color': '#3498db', 'textDecoration': 'none'})
-        ], style={'padding': '20px 30px', 'backgroundColor': 'white', 
-                 'borderBottom': '1px solid #eee', 'display': 'flex', 
-                 'justifyContent': 'space-between', 'alignItems': 'center'}),
-        
-        html.Div([
-            # Controls
-            html.Div([
-                html.Label("Select Terminal", style={'fontWeight': 'bold'}),
-                dcc.Dropdown(
-                    id='terminal-select',
-                    options=[
-                        {'label': 'All Terminals', 'value': 'All'},
-                        {'label': 'Terminal 1', 'value': 'T1'},
-                        {'label': 'Terminal 2', 'value': 'T2'},
-                        {'label': 'Terminal 3', 'value': 'T3'}
-                    ],
-                    value='All',
-                    style={'width': '200px'}
-                ),
-                
-                html.Button("🔄 Update Analysis", id='update-btn',
-                           style={'marginLeft': '20px', 'padding': '8px 20px',
-                                  'backgroundColor': '#3498db', 'color': 'white',
-                                  'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'})
-            ], style={'padding': '20px', 'backgroundColor': 'white', 'borderRadius': '10px',
-                     'margin': '20px', 'boxShadow': '0 2px 5px rgba(0,0,0,0.05)'}),
-            
-            # Heatmap
-            html.Div([
-                dcc.Graph(id='passenger-heatmap', 
-                         figure=passenger_ai.get_heatmap())
-            ], style={'padding': '20px', 'backgroundColor': 'white', 'borderRadius': '10px',
-                     'margin': '20px', 'boxShadow': '0 2px 5px rgba(0,0,0,0.05)'}),
-            
-            # Predictions Table
-            html.Div([
-                html.H3("📈 Congestion Predictions (Next 3 Hours)"),
-                html.Table([
-                    html.Thead(html.Tr([
-                        html.Th("Time"), html.Th("Congestion"), 
-                        html.Th("Risk Level"), html.Th("Recommendation")
-                    ])),
-                    html.Tbody([
-                        html.Tr([
-                            html.Td(pred['hour']),
-                            html.Td(pred['congestion']),
-                            html.Td(pred['risk'], style={
-                                'color': '#e74c3c' if pred['risk'] == 'High' else 
-                                        '#f39c12' if pred['risk'] == 'Medium' else '#27ae60',
-                                'fontWeight': 'bold'
-                            }),
-                            html.Td(pred['recommendation'])
-                        ]) for pred in predictions
-                    ])
-                ], style={'width': '100%', 'borderCollapse': 'collapse', 'marginTop': '20px'})
-            ], style={'padding': '20px', 'backgroundColor': 'white', 'borderRadius': '10px',
-                     'margin': '20px', 'boxShadow': '0 2px 5px rgba(0,0,0,0.05)'}),
-            
-            # Insights
-            html.Div([
-                html.H3("💡 Key Insights"),
-                html.Ul([
-                    html.Li("Peak congestion occurs 8-10 AM and 5-7 PM daily"),
-                    html.Li("Terminal 3 shows highest passenger volume"),
-                    html.Li("Security wait times increase by 40% during peaks"),
-                    html.Li("Consider adding mobile check-in stations in T2")
-                ])
-            ], style={'padding': '20px', 'backgroundColor': '#e8f6f3', 'borderRadius': '10px',
-                     'margin': '20px', 'borderLeft': '5px solid #27ae60'}),
-        ], style={'maxWidth': '1400px', 'margin': '0 auto', 'padding': '20px'}),
+    if not df_passengers.empty:
+        terminal_list = list(df_passengers['terminal'].unique())
+    else:
+        terminal_list = list(passenger_ai.data['terminal'].unique())
+    opts = [{'label': t, 'value': t} for t in ['All'] + terminal_list]
+    return html.Div(style=PAGE, children=[
+        navbar(),
+        html.Div(style={'padding': '30px 40px', 'maxWidth': '1200px', 'margin': '0 auto'}, children=[
+            html.H2("Passenger Flow Monitoring", style={'color': ACC_TEAL, 'fontWeight': '400'}),
+            html.P("Interactive heatmaps of passenger distribution across terminals and gates.",
+                   style={'color': TEXT_SEC}),
+            html.Div(style={'display': 'flex', 'alignItems': 'center', 'gap': '16px', 'margin': '20px 0'}, children=[
+                html.Label("Terminal:", style={'color': TEXT_SEC, 'fontSize': '13px'}),
+                dcc.Dropdown(id='terminal-select', options=opts, value='All',
+                             style={'width': '180px', 'color': '#000'}),
+            ]),
+            html.Div(style=CARD, children=[
+                dcc.Graph(id='passenger-heatmap', figure=passenger_ai.get_heatmap('All'))
+            ])
+        ])
     ])
+
 
 def gate_optimization_layout():
-    """Gate optimization module"""
     suggestions = gate_ai.get_optimization_suggestions()
-    
-    return html.Div([
-        html.Div([
-            html.H2("🚪 Gate Optimization Engine", 
-                   style={'margin': '0', 'color': '#2c3e50'}),
-            dcc.Link("← Back to Dashboard", href="/", 
-                    style={'color': '#3498db', 'textDecoration': 'none'})
-        ], style={'padding': '20px 30px', 'backgroundColor': 'white', 
-                 'borderBottom': '1px solid #eee', 'display': 'flex', 
-                 'justifyContent': 'space-between', 'alignItems': 'center'}),
-        
-        html.Div([
-            # Gate Performance Chart
+    pri_color   = {'HIGH': ACC_RED, 'MEDIUM': ACC_AMBER, 'LOW': ACC_GREEN}
+    return html.Div(style=PAGE, children=[
+        navbar(),
+        html.Div(style={'padding': '30px 40px', 'maxWidth': '1200px', 'margin': '0 auto'}, children=[
+            html.H2("Gate Optimisation", style={'color': ACC_BLUE, 'fontWeight': '400'}),
+            html.P("Gate performance metrics and AI-driven reassignment suggestions.", style={'color': TEXT_SEC}),
+            html.Div(style=CARD, children=[dcc.Graph(figure=gate_ai.get_gate_utilization_chart())]),
+            html.H3("AI Suggestions", style={'color': TEXT_HEAD, 'fontWeight': '400'}),
             html.Div([
-                dcc.Graph(figure=gate_ai.get_gate_utilization_chart())
-            ], style={'padding': '20px', 'backgroundColor': 'white', 'borderRadius': '10px',
-                     'margin': '20px 0', 'boxShadow': '0 2px 5px rgba(0,0,0,0.05)'}),
-            
-            # AI Recommendations
-            html.Div([
-                html.H3("🤖 AI Optimization Suggestions"),
-                html.Div([
-                    html.Div([
-                        html.H4(f"#{idx+1}: {suggestion['priority']} Priority",
-                               style={'color': '#e74c3c' if suggestion['priority'] == 'HIGH' else 
-                                      '#f39c12' if suggestion['priority'] == 'MEDIUM' else '#27ae60'}),
-                        html.P(suggestion['action'], style={'fontSize': '18px', 'fontWeight': 'bold'}),
-                        html.P(f"📋 Reason: {suggestion['reason']}"),
-                        html.P(f"🎯 Impact: {suggestion['impact']}"),
-                        html.Button("✅ Implement", style={
-                            'backgroundColor': '#2ecc71', 'color': 'white',
-                            'border': 'none', 'padding': '8px 16px',
-                            'borderRadius': '4px', 'cursor': 'pointer',
-                            'marginTop': '10px'
-                        })
-                    ], className="module-card", style={'margin': '10px 0'})
-                    for idx, suggestion in enumerate(suggestions)
-                ])
-            ], style={'padding': '20px', 'backgroundColor': '#f8f9fa', 'borderRadius': '10px',
-                     'margin': '20px 0'}),
-            
-            # Performance Table
-            html.Div([
-                html.H3("📊 Gate Performance Ranking"),
-                html.Table([
-                    html.Thead(html.Tr([
-                        html.Th("Rank"), html.Th("Gate"), html.Th("Flights"),
-                        html.Th("Avg Delay"), html.Th("Utilization"), html.Th("Efficiency")
-                    ])),
-                    html.Tbody([
-                        html.Tr([
-                            html.Td(idx+1),
-                            html.Td(gate),
-                            html.Td(stats['flight_count']),
-                            html.Td(f"{stats['avg_delay']:.1f} min"),
-                            html.Td(f"{stats['utilization']}%"),
-                            html.Td(f"{stats['efficiency']}%", style={
-                                'color': '#27ae60' if stats['efficiency'] > 80 else 
-                                        '#f39c12' if stats['efficiency'] > 60 else '#e74c3c'
-                            })
-                        ]) for idx, (gate, stats) in enumerate(
-                            gate_ai.analyze_gate_performance().head(10).iterrows()
-                        )
-                    ])
-                ], style={'width': '100%', 'borderCollapse': 'collapse', 'marginTop': '20px'})
-            ], style={'padding': '20px', 'backgroundColor': 'white', 'borderRadius': '10px',
-                     'margin': '20px 0', 'boxShadow': '0 2px 5px rgba(0,0,0,0.05)'}),
-        ], style={'maxWidth': '1400px', 'margin': '0 auto', 'padding': '20px'}),
+                html.Div(style={
+                    **PANEL,
+                    'borderLeft': f'3px solid {pri_color.get(s["priority"], TEXT_SEC)}',
+                    'marginBottom': '12px'
+                }, children=[
+                    html.Div(s['action'], style={'color': TEXT_HEAD, 'fontWeight': '500'}),
+                    html.Div(s['reason'],  style={'color': TEXT_SEC, 'fontSize': '13px', 'marginTop': '4px'}),
+                    html.Div(f"Impact: {s['impact']}  ·  Priority: {s['priority']}",
+                             style={'color': pri_color.get(s['priority'], TEXT_SEC),
+                                    'fontSize': '12px', 'marginTop': '6px'})
+                ]) for s in suggestions
+            ])
+        ])
     ])
+
 
 def risk_management_layout():
-    """Risk management module"""
-    terminals = ['T1', 'T2', 'T3']
-    weather_conditions = ['Clear', 'Cloudy', 'Rain', 'Storm']
-    current_hour = datetime.now().hour
-    
-    risk_analyses = []
-    for terminal in terminals:
-        analysis = risk_ai.get_risk_analysis(terminal)
-        risk_analyses.append({
-            'terminal': terminal,
-            **analysis
-        })
-    
-    return html.Div([
-        html.Div([
-            html.H2("⚠️ Operational Risk Management", 
-                   style={'margin': '0', 'color': '#2c3e50'}),
-            dcc.Link("← Back to Dashboard", href="/", 
-                    style={'color': '#3498db', 'textDecoration': 'none'})
-        ], style={'padding': '20px 30px', 'backgroundColor': 'white', 
-                 'borderBottom': '1px solid #eee', 'display': 'flex', 
-                 'justifyContent': 'space-between', 'alignItems': 'center'}),
-        
-        html.Div([
-            # Risk Overview
-            html.Div([
-                html.H3("📈 Terminal Risk Overview"),
-                html.Div([
+    terminal_opts = (
+        [{'label': t, 'value': t} for t in df_flights['terminal'].unique()]
+        if not df_flights.empty else [{'label': 'T1', 'value': 'T1'}]
+    )
+    return html.Div(style=PAGE, children=[
+        navbar(),
+        html.Div(style={'padding': '30px 40px', 'maxWidth': '800px', 'margin': '0 auto'}, children=[
+            html.H2("Operational Risk Management", style={'color': ACC_RED, 'fontWeight': '400'}),
+            html.P("Real-time risk scoring based on terminal, time, and weather.", style={'color': TEXT_SEC}),
+            html.Div(style=CARD, children=[
+                html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'alignItems': 'flex-end'},
+                         children=[
                     html.Div([
-                        html.H4(analysis['terminal']),
-                        html.H2(f"{analysis['score']:.0f}", 
-                               style={'color': analysis['color'], 'fontSize': '48px'}),
-                        html.P(analysis['level'], style={'fontWeight': 'bold'}),
-                        html.Hr(),
-                        html.P("Recommended Actions:"),
-                        html.Ul([html.Li(action) for action in analysis['actions'][:2]])
-                    ], className="module-card", style={'width': '30%', 'textAlign': 'center'})
-                    for analysis in risk_analyses
-                ], style={'display': 'flex', 'justifyContent': 'space-between', 'margin': '20px 0'})
-            ], style={'padding': '20px', 'backgroundColor': 'white', 'borderRadius': '10px',
-                     'margin': '20px 0', 'boxShadow': '0 2px 5px rgba(0,0,0,0.05)'}),
-            
-            # Risk Calculator
-            html.Div([
-                html.H3("🧮 Risk Score Calculator"),
-                html.Div([
+                        html.Label("Terminal", style={'color': TEXT_SEC, 'fontSize': '12px',
+                                                      'display': 'block', 'marginBottom': '6px'}),
+                        dcc.Dropdown(id='risk-terminal', options=terminal_opts, value='T1',
+                                     style={'width': '120px', 'color': '#000'})
+                    ]),
                     html.Div([
-                        html.Label("Terminal"),
-                        dcc.Dropdown(
-                            id='risk-terminal',
-                            options=[{'label': t, 'value': t} for t in terminals],
-                            value='T1'
-                        )
-                    ], style={'width': '30%'}),
-                    
+                        html.Label("Hour (0–23)", style={'color': TEXT_SEC, 'fontSize': '12px',
+                                                         'display': 'block', 'marginBottom': '6px'}),
+                        dcc.Input(id='risk-hour', type='number', min=0, max=23,
+                                  value=datetime.now().hour,
+                                  style={'width': '70px', 'backgroundColor': BG_INPUT,
+                                         'color': TEXT_PRI, 'border': f'1px solid {BORDER}',
+                                         'borderRadius': '4px', 'padding': '6px'})
+                    ]),
                     html.Div([
-                        html.Label("Hour of Day"),
-                        dcc.Slider(
-                            id='risk-hour',
-                            min=0, max=23, step=1,
-                            value=current_hour,
-                            marks={i: f'{i}:00' for i in range(0, 24, 3)}
-                        )
-                    ], style={'width': '60%', 'marginTop': '20px'}),
-                    
-                    html.Div([
-                        html.Label("Weather Condition"),
-                        dcc.RadioItems(
-                            id='risk-weather',
-                            options=[{'label': w, 'value': w} for w in weather_conditions],
-                            value='Clear',
-                            inline=True
-                        )
-                    ], style={'marginTop': '20px'}),
-                    
-                    html.Button("Calculate Risk", id='calculate-risk-btn',
-                               style={'marginTop': '20px', 'padding': '10px 30px',
-                                      'backgroundColor': '#3498db', 'color': 'white',
-                                      'border': 'none', 'borderRadius': '4px', 'cursor': 'pointer'})
-                ]),
-                
-                html.Div(id='risk-calculation-result', style={'marginTop': '30px'})
-            ], style={'padding': '20px', 'backgroundColor': 'white', 'borderRadius': '10px',
-                     'margin': '20px 0', 'boxShadow': '0 2px 5px rgba(0,0,0,0.05)'}),
-            
-            # Risk Factors
-            html.Div([
-                html.H3("🔍 Risk Factors Analysis"),
-                html.Ul([
-                    html.Li("Delays (40% weight): Historical delay patterns by terminal/airline"),
-                    html.Li("Congestion (30%): Passenger volume and peak hour analysis"),
-                    html.Li("Weather (20%): Current and forecasted conditions"),
-                    html.Li("Time of Day (10%): Peak vs off-peak operations")
-                ]),
-                html.P("Total risk score = Σ(Factor × Weight)", style={'fontStyle': 'italic'})
-            ], style={'padding': '20px', 'backgroundColor': '#fef5e7', 'borderRadius': '10px',
-                     'margin': '20px 0', 'borderLeft': '5px solid #f39c12'}),
-        ], style={'maxWidth': '1400px', 'margin': '0 auto', 'padding': '20px'}),
+                        html.Label("Weather", style={'color': TEXT_SEC, 'fontSize': '12px',
+                                                     'display': 'block', 'marginBottom': '6px'}),
+                        dcc.Dropdown(id='risk-weather',
+                                     options=[{'label': w, 'value': w} for w in ['Clear','Cloudy','Rain','Storm']],
+                                     value='Clear', style={'width': '140px', 'color': '#000'})
+                    ]),
+                    html.Button("Calculate Risk", id='calculate-risk-btn', n_clicks=0,
+                                style={'backgroundColor': ACC_RED, 'color': TEXT_HEAD, 'border': 'none',
+                                       'padding': '10px 22px', 'borderRadius': '5px',
+                                       'cursor': 'pointer', 'fontWeight': '600'})
+                ])
+            ]),
+            html.Div(id='risk-calculation-result')
+        ])
     ])
+
 
 def prediction_layout():
-    """AI prediction module (your original feature)"""
-    airlines = df_flights['airline'].unique().tolist() if not df_flights.empty else []
-    
-    return html.Div([
-        html.Div([
-            html.H2("🤖 AI Delay Prediction", 
-                   style={'margin': '0', 'color': '#2c3e50'}),
-            dcc.Link("← Back to Dashboard", href="/", 
-                    style={'color': '#3498db', 'textDecoration': 'none'})
-        ], style={'padding': '20px 30px', 'backgroundColor': 'white', 
-                 'borderBottom': '1px solid #eee', 'display': 'flex', 
-                 'justifyContent': 'space-between', 'alignItems': 'center'}),
-        
-        html.Div([
-            # Prediction Form
-            html.Div([
-                html.H3("Flight Delay Prediction"),
-                html.Div([
+    airlines = df_flights['airline'].unique().tolist() if not df_flights.empty else ['TunisAir']
+    return html.Div(style=PAGE, children=[
+        navbar(),
+        html.Div(style={'padding': '30px 40px', 'maxWidth': '1100px', 'margin': '0 auto'}, children=[
+            html.H2("AI Delay Prediction", style={'color': ACC_PURP, 'fontWeight': '400'}),
+            html.P("ML-powered delay forecasting via FastAPI — with SHAP explainability.",
+                   style={'color': TEXT_SEC}),
+            html.Div(style=CARD, children=[
+                html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'alignItems': 'flex-end'},
+                         children=[
                     html.Div([
-                        html.Label("Airline", style={'fontWeight': 'bold'}),
-                        dcc.Dropdown(
-                            id='pred-airline',
-                            options=[{'label': airline, 'value': airline} for airline in airlines],
-                            value=airlines[0] if airlines else ''
-                        )
-                    ], style={'width': '30%'}),
-                    
+                        html.Label("Airline", style={'color': TEXT_SEC, 'fontSize': '12px',
+                                                     'display': 'block', 'marginBottom': '6px'}),
+                        dcc.Dropdown(id='pred-airline',
+                                     options=[{'label': a, 'value': a} for a in airlines],
+                                     value=airlines[0], style={'width': '200px', 'color': '#000'})
+                    ]),
                     html.Div([
-                        html.Label("Terminal", style={'fontWeight': 'bold'}),
-                        dcc.Dropdown(
-                            id='pred-terminal',
-                            options=[
-                                {'label': 'T1', 'value': 'T1'},
-                                {'label': 'T2', 'value': 'T2'},
-                                {'label': 'T3', 'value': 'T3'}
-                            ],
-                            value='T1'
-                        )
-                    ], style={'width': '30%'}),
-                    
+                        html.Label("Terminal", style={'color': TEXT_SEC, 'fontSize': '12px',
+                                                      'display': 'block', 'marginBottom': '6px'}),
+                        dcc.Dropdown(id='pred-terminal',
+                                     options=[{'label': t, 'value': t} for t in ['T1', 'T2', 'T3']],
+                                     value='T1', style={'width': '100px', 'color': '#000'})
+                    ]),
                     html.Div([
-                        html.Label("Day of Week", style={'fontWeight': 'bold'}),
-                        dcc.Dropdown(
-                            id='pred-day',
-                            options=[
-                                {'label': 'Monday', 'value': 'Mon'},
-                                {'label': 'Tuesday', 'value': 'Tue'},
-                                {'label': 'Wednesday', 'value': 'Wed'},
-                                {'label': 'Thursday', 'value': 'Thu'},
-                                {'label': 'Friday', 'value': 'Fri'},
-                                {'label': 'Saturday', 'value': 'Sat'},
-                                {'label': 'Sunday', 'value': 'Sun'}
-                            ],
-                            value='Mon'
-                        )
-                    ], style={'width': '30%'}),
-                ], style={'display': 'flex', 'justifyContent': 'space-between', 'gap': '20px'}),
-                
-                html.Button("🚀 Run Prediction", id='predict-btn',
-                           style={'marginTop': '30px', 'padding': '12px 40px',
-                                  'backgroundColor': '#9b59b6', 'color': 'white',
-                                  'border': 'none', 'borderRadius': '6px', 'cursor': 'pointer',
-                                  'fontSize': '16px', 'fontWeight': 'bold'})
-            ], style={'padding': '30px', 'backgroundColor': 'white', 'borderRadius': '10px',
-                     'margin': '20px 0', 'boxShadow': '0 2px 5px rgba(0,0,0,0.05)'}),
-            
-            # Results
-            html.Div(id='prediction-results', style={'marginTop': '30px'}),
-            
-            # Historical Analysis
-            html.Div([
-                html.H3("📊 Historical Delay Analysis"),
-                html.P("Based on your flight data, here are the current delay patterns:"),
-                
-                html.Div([
+                        html.Label("Weather", style={'color': TEXT_SEC, 'fontSize': '12px',
+                                                     'display': 'block', 'marginBottom': '6px'}),
+                        dcc.Dropdown(id='pred-weather',
+                                     options=[{'label': w, 'value': w} for w in ['Clear','Cloudy','Rain','Storm']],
+                                     value='Clear', style={'width': '130px', 'color': '#000'})
+                    ]),
                     html.Div([
-                        html.H4("Top Airlines by Delay"),
-                        dcc.Graph(figure=px.bar(
-                            df_flights.groupby('airline')['delay_minutes'].mean().reset_index().sort_values('delay_minutes', ascending=False).head(10),
-                            x='airline', y='delay_minutes',
-                            title='Average Delay by Airline',
-                            color='delay_minutes'
-                        ))
-                    ], style={'width': '48%'}),
-                    
-                    html.Div([
-                        html.H4("Delay Distribution"),
-                        dcc.Graph(figure=px.histogram(
-                            df_flights, x='delay_minutes',
-                            title='Delay Minutes Distribution',
-                            nbins=30
-                        ))
-                    ], style={'width': '48%'}),
-                ], style={'display': 'flex', 'justifyContent': 'space-between', 'marginTop': '20px'})
-            ], style={'padding': '30px', 'backgroundColor': 'white', 'borderRadius': '10px',
-                     'margin': '20px 0', 'boxShadow': '0 2px 5px rgba(0,0,0,0.05)'}),
-        ], style={'maxWidth': '1400px', 'margin': '0 auto', 'padding': '20px'}),
+                        html.Label("Day", style={'color': TEXT_SEC, 'fontSize': '12px',
+                                                 'display': 'block', 'marginBottom': '6px'}),
+                        dcc.Dropdown(id='pred-day',
+                                     options=[{'label': d, 'value': d} for d in
+                                              ['Monday','Tuesday','Wednesday','Thursday',
+                                               'Friday','Saturday','Sunday']],
+                                     value=datetime.now().strftime("%A"),
+                                     style={'width': '150px', 'color': '#000'})
+                    ]),
+                    html.Button("Run Prediction", id='predict-btn', n_clicks=0,
+                                style={'backgroundColor': ACC_PURP, 'color': TEXT_HEAD, 'border': 'none',
+                                       'padding': '10px 22px', 'borderRadius': '5px',
+                                       'cursor': 'pointer', 'fontWeight': '600'})
+                ])
+            ]),
+            html.Div(id='prediction-results', style={'marginTop': '20px'}),
+            html.Div(style=CARD, children=[
+                html.H3("Historical Delay Analysis",
+                        style={'color': TEXT_HEAD, 'fontWeight': '400', 'marginTop': '0'}),
+                html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap'}, children=[
+                    html.Div(style={'flex': '1', 'minWidth': '300px'}, children=[
+                        dcc.Graph(figure=(
+                            px.bar(
+                                df_flights.groupby('airline')['delay_minutes'].mean()
+                                          .reset_index().sort_values('delay_minutes', ascending=False),
+                                x='airline', y='delay_minutes',
+                                title='Average Delay by Airline',
+                                color='delay_minutes', color_continuous_scale='Reds'
+                            ).update_layout(paper_bgcolor=BG_CARD, plot_bgcolor=BG_PANEL, font_color=TEXT_PRI)
+                        ) if not df_flights.empty else go.Figure())
+                    ]),
+                    html.Div(style={'flex': '1', 'minWidth': '300px'}, children=[
+                        dcc.Graph(figure=(
+                            px.histogram(df_flights, x='delay_minutes', nbins=30,
+                                         title='Delay Distribution',
+                                         color_discrete_sequence=[ACC_BLUE])
+                            .update_layout(paper_bgcolor=BG_CARD, plot_bgcolor=BG_PANEL, font_color=TEXT_PRI)
+                        ) if not df_flights.empty else go.Figure())
+                    ])
+                ])
+            ])
+        ])
     ])
+
+
+def forecast_layout():
+    return html.Div(style=PAGE, children=[
+        navbar(),
+        html.Div(style={'padding': '30px 40px', 'maxWidth': '1200px', 'margin': '0 auto'}, children=[
+            html.H2("Operational Delay Forecast", style={'color': ACC_CYAN, 'fontWeight': '400'}),
+            html.P("Time-series delay forecast for the next 24 hours and 7 days ahead.",
+                   style={'color': TEXT_SEC}),
+            html.Div(style=CARD, children=[
+                html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap', 'alignItems': 'flex-end'},
+                         children=[
+                    html.Div([
+                        html.Label("Weather Conditions", style={'color': TEXT_SEC, 'fontSize': '12px',
+                                                                'display': 'block', 'marginBottom': '6px'}),
+                        dcc.Dropdown(id='forecast-weather',
+                                     options=[{'label': w, 'value': w} for w in ['Clear','Cloudy','Rain','Storm']],
+                                     value='Clear', style={'width': '160px', 'color': '#000'})
+                    ]),
+                    html.Div([
+                        html.Label("Hours Ahead", style={'color': TEXT_SEC, 'fontSize': '12px',
+                                                         'display': 'block', 'marginBottom': '6px'}),
+                        dcc.Dropdown(id='forecast-hours',
+                                     options=[{'label': f'{h} hours', 'value': h} for h in [6, 12, 18, 24]],
+                                     value=12, style={'width': '140px', 'color': '#000'})
+                    ]),
+                    html.Button("Generate Forecast", id='forecast-btn', n_clicks=0,
+                                style={'backgroundColor': ACC_CYAN, 'color': TEXT_HEAD, 'border': 'none',
+                                       'padding': '10px 22px', 'borderRadius': '5px',
+                                       'cursor': 'pointer', 'fontWeight': '600'})
+                ])
+            ]),
+            html.Div(id='forecast-results')
+        ])
+    ])
+
 
 def analytics_layout():
-    """Advanced analytics module"""
-    return html.Div([
-        html.Div([
-            html.H2("📊 Advanced Analytics", 
-                   style={'margin': '0', 'color': '#2c3e50'}),
-            dcc.Link("← Back to Dashboard", href="/", 
-                    style={'color': '#3498db', 'textDecoration': 'none'})
-        ], style={'padding': '20px 30px', 'backgroundColor': 'white', 
-                 'borderBottom': '1px solid #eee', 'display': 'flex', 
-                 'justifyContent': 'space-between', 'alignItems': 'center'}),
-        
-        html.Div([
-            html.Div([
-                html.H3("Coming Soon..."),
-                html.P("This module will include:"),
-                html.Ul([
-                    html.Li("📈 Time series forecasting"),
-                    html.Li("🔍 Anomaly detection"),
-                    html.Li("📊 Comparative analytics"),
-                    html.Li("📱 Mobile dashboard"),
-                    html.Li("🤖 Advanced ML models")
-                ]),
-                html.P("Check back in the next update!", 
-                      style={'fontStyle': 'italic', 'color': '#7f8c8d'})
-            ], style={'padding': '50px', 'textAlign': 'center', 'backgroundColor': '#f8f9fa',
-                     'borderRadius': '10px', 'margin': '100px 0'})
-        ], style={'maxWidth': '1400px', 'margin': '0 auto', 'padding': '20px'}),
+    if not df_flights.empty:
+        fig_weather = px.box(
+            df_flights, x='weather', y='delay_minutes', color='weather',
+            title='Delay Distribution by Weather',
+            color_discrete_map={'Clear': ACC_GREEN, 'Cloudy': ACC_BLUE,
+                                'Rain': ACC_AMBER, 'Storm': ACC_RED}
+        ).update_layout(paper_bgcolor=BG_CARD, plot_bgcolor=BG_PANEL, font_color=TEXT_PRI)
+
+        fig_airline = px.box(
+            df_flights, x='airline', y='delay_minutes', color='airline',
+            title='Delay Distribution by Airline'
+        ).update_layout(paper_bgcolor=BG_CARD, plot_bgcolor=BG_PANEL, font_color=TEXT_PRI)
+
+        hour_df = df_flights.dropna(subset=['departure_hour']).copy()
+        hour_df['departure_hour'] = hour_df['departure_hour'].astype(int)
+        hour_avg = hour_df.groupby('departure_hour')['delay_minutes'].mean().reset_index()
+        fig_hour = px.bar(
+            hour_avg, x='departure_hour', y='delay_minutes',
+            title='Average Delay by Hour of Day',
+            color='delay_minutes', color_continuous_scale='Reds'
+        ).update_layout(paper_bgcolor=BG_CARD, plot_bgcolor=BG_PANEL, font_color=TEXT_PRI)
+
+        risk_counts = df_flights['delay_risk'].value_counts().reset_index()
+        risk_counts.columns = ['risk', 'count']
+        fig_risk = px.pie(
+            risk_counts, names='risk', values='count',
+            title='Flight Risk Distribution',
+            color='risk',
+            color_discrete_map={'Low': ACC_GREEN, 'Medium': ACC_AMBER, 'High': ACC_RED}
+        ).update_layout(paper_bgcolor=BG_CARD, font_color=TEXT_PRI)
+
+        fig_scatter = px.scatter(
+            df_flights.sample(min(500, len(df_flights))),
+            x='departure_hour', y='delay_minutes',
+            color='weather', size='delay_minutes',
+            title='Weather vs Delay Correlation',
+            color_discrete_map={'Clear': ACC_GREEN, 'Cloudy': ACC_BLUE,
+                                'Rain': ACC_AMBER, 'Storm': ACC_RED}
+        ).update_layout(paper_bgcolor=BG_CARD, plot_bgcolor=BG_PANEL, font_color=TEXT_PRI)
+
+        if 'day_of_week' in df_flights.columns:
+            day_order = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+            day_avg   = df_flights.groupby('day_of_week')['delay_minutes'].mean().reindex(day_order).reset_index()
+            fig_day   = px.bar(
+                day_avg, x='day_of_week', y='delay_minutes',
+                title='Average Delay by Day of Week',
+                color='delay_minutes', color_continuous_scale='Oranges'
+            ).update_layout(paper_bgcolor=BG_CARD, plot_bgcolor=BG_PANEL, font_color=TEXT_PRI)
+        else:
+            fig_day = go.Figure()
+    else:
+        fig_weather = fig_airline = fig_hour = fig_risk = fig_scatter = fig_day = go.Figure()
+
+    return html.Div(style=PAGE, children=[
+        navbar(),
+        html.Div(style={'padding': '30px 40px', 'maxWidth': '1200px', 'margin': '0 auto'}, children=[
+            html.H2("Advanced Analytics", style={'color': TEXT_HEAD, 'fontWeight': '400'}),
+            html.P("Historical weather vs delay correlation and operational insights.",
+                   style={'color': TEXT_SEC}),
+            html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap'}, children=[
+                html.Div(style={**CARD, 'flex': '1', 'minWidth': '400px'}, children=[dcc.Graph(figure=fig_weather)]),
+                html.Div(style={**CARD, 'flex': '1', 'minWidth': '400px'}, children=[dcc.Graph(figure=fig_airline)]),
+                html.Div(style={**CARD, 'flex': '1', 'minWidth': '400px'}, children=[dcc.Graph(figure=fig_hour)]),
+                html.Div(style={**CARD, 'flex': '1', 'minWidth': '400px'}, children=[dcc.Graph(figure=fig_risk)]),
+                html.Div(style={**CARD, 'flex': '1', 'minWidth': '400px'}, children=[dcc.Graph(figure=fig_scatter)]),
+                html.Div(style={**CARD, 'flex': '1', 'minWidth': '400px'}, children=[dcc.Graph(figure=fig_day)]),
+            ])
+        ])
     ])
 
+
 # =========================
-# APP LAYOUT & CALLBACKS
+# APP LAYOUT
 # =========================
 app.layout = html.Div([
     dcc.Location(id='url', refresh=False),
     html.Div(id='page-content')
 ])
 
-@app.callback(
-    Output('page-content', 'children'),
-    Input('url', 'pathname')
-)
+
+# =========================
+# CALLBACKS
+# =========================
+@app.callback(Output('page-content', 'children'), Input('url', 'pathname'))
 def display_page(pathname):
-    """Route to different pages"""
-    if pathname == '/passenger':
-        return passenger_flow_layout()
-    elif pathname == '/gates':
-        return gate_optimization_layout()
-    elif pathname == '/risk':
-        return risk_management_layout()
-    elif pathname == '/prediction':
-        return prediction_layout()
-    elif pathname == '/analytics':
-        return analytics_layout()
+    if pathname == '/passenger': return passenger_flow_layout()
+    if pathname == '/gates':     return gate_optimization_layout()
+    if pathname == '/risk':      return risk_management_layout()
+    if pathname == '/prediction':return prediction_layout()
+    if pathname == '/forecast':  return forecast_layout()
+    if pathname == '/analytics': return analytics_layout()
     return home_layout()
+
+
+@app.callback(Output('last-refresh', 'children'), Input('interval-refresh', 'n_intervals'))
+def update_refresh_time(n):
+    return f"Last refreshed: {datetime.now().strftime('%H:%M:%S')}  ·  Auto-refresh every 60s"
+
+
+@app.callback(Output('passenger-heatmap', 'figure'), Input('terminal-select', 'value'))
+def update_heatmap(terminal):
+    return passenger_ai.get_heatmap(terminal)
+
+
+@app.callback(
+    Output('forecast-results', 'children'),
+    Input('forecast-btn', 'n_clicks'),
+    State('forecast-weather', 'value'),
+    State('forecast-hours', 'value')
+)
+def run_forecast(n_clicks, weather, hours_ahead):
+    if not n_clicks:
+        raise PreventUpdate
+
+    try:
+        response = httpx.post(f"{API_URL}/forecast", json={
+            "weather":     weather,
+            "hours_ahead": hours_ahead
+        }, timeout=30)
+        data = response.json()
+    except Exception as ex:
+        return html.Div(f"Forecast unavailable: {ex}", style={'color': ACC_RED, 'padding': '20px'})
+
+    hourly   = data["hourly"]
+    weekly   = data["weekly"]
+    warnings = hourly.get("peak_warnings", [])
+
+    fig_hourly = go.Figure()
+    fig_hourly.add_trace(go.Scatter(
+        x=hourly["history"]["times"], y=hourly["history"]["values"],
+        name="Historical (24h)", line=dict(color=ACC_BLUE, width=2), mode='lines'
+    ))
+    fig_hourly.add_trace(go.Scatter(
+        x=hourly["forecast"]["times"] + hourly["forecast"]["times"][::-1],
+        y=hourly["forecast"]["upper_bound"] + hourly["forecast"]["lower_bound"][::-1],
+        fill='toself', fillcolor='rgba(78,158,142,0.15)',
+        line=dict(color='rgba(0,0,0,0)'), name="Confidence Interval"
+    ))
+    fig_hourly.add_trace(go.Scatter(
+        x=hourly["forecast"]["times"], y=hourly["forecast"]["values"],
+        name=f"Forecast ({hours_ahead}h)", line=dict(color=ACC_TEAL, width=3, dash='dot'),
+        mode='lines+markers', marker=dict(size=6)
+    ))
+    fig_hourly.update_layout(
+        title=f'Delay Forecast — Next {hours_ahead} Hours ({weather} conditions)',
+        xaxis_title='Time', yaxis_title='Average Delay (min)',
+        height=420, hovermode='x unified',
+        paper_bgcolor=BG_CARD, plot_bgcolor=BG_PANEL, font_color=TEXT_PRI,
+        legend=dict(bgcolor=BG_PANEL, bordercolor=BORDER)
+    )
+
+    bar_colors = [ACC_RED if v > 40 else ACC_AMBER if v > 25 else ACC_GREEN for v in weekly["values"]]
+    fig_weekly = go.Figure(go.Bar(
+        x=weekly["days"], y=weekly["values"],
+        marker_color=bar_colors,
+        text=[f"{v:.0f} min" for v in weekly["values"]],
+        textposition='outside'
+    ))
+    fig_weekly.update_layout(
+        title='7-Day Delay Outlook', xaxis_title='Day', yaxis_title='Expected Avg Delay (min)',
+        height=320, paper_bgcolor=BG_CARD, plot_bgcolor=BG_PANEL, font_color=TEXT_PRI
+    )
+
+    warning_cards = []
+    for w in warnings[:4]:
+        w_color = ACC_RED if w['level'] == 'CRITICAL' else ACC_AMBER
+        warning_cards.append(html.Div(style={
+            **PANEL, 'borderLeft': f'3px solid {w_color}', 'marginBottom': '8px',
+            'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center'
+        }, children=[
+            html.Span(f"⚠ {w['message']}", style={'color': TEXT_HEAD, 'fontSize': '13px'}),
+            html.Span(w['level'], style={'color': w_color, 'fontWeight': '600', 'fontSize': '12px'})
+        ]))
+
+    forecast_avg = round(sum(hourly["forecast"]["values"]) / len(hourly["forecast"]["values"]), 1)
+    forecast_max = round(max(hourly["forecast"]["values"]), 1)
+    peak_day     = weekly.get("peak_day", "—")
+
+    return html.Div([
+        html.Div(style={'display': 'flex', 'gap': '16px', 'flexWrap': 'wrap', 'marginBottom': '24px'}, children=[
+            html.Div(style={**CARD, 'textAlign': 'center', 'flex': '1', 'minWidth': '150px',
+                            'borderTop': f'3px solid {ACC_CYAN}', 'marginBottom': '0'}, children=[
+                html.Div(f"{forecast_avg} min", style={'fontSize': '28px', 'color': ACC_CYAN, 'fontWeight': '300'}),
+                html.Div("Avg Forecast Delay", style={'color': TEXT_SEC, 'fontSize': '12px'})
+            ]),
+            html.Div(style={**CARD, 'textAlign': 'center', 'flex': '1', 'minWidth': '150px',
+                            'borderTop': f'3px solid {ACC_RED}', 'marginBottom': '0'}, children=[
+                html.Div(f"{forecast_max} min", style={'fontSize': '28px', 'color': ACC_RED, 'fontWeight': '300'}),
+                html.Div("Peak Forecast Delay", style={'color': TEXT_SEC, 'fontSize': '12px'})
+            ]),
+            html.Div(style={**CARD, 'textAlign': 'center', 'flex': '1', 'minWidth': '150px',
+                            'borderTop': f'3px solid {ACC_AMBER}', 'marginBottom': '0'}, children=[
+                html.Div(str(len(warnings)), style={'fontSize': '28px', 'color': ACC_AMBER, 'fontWeight': '300'}),
+                html.Div("Peak Hour Warnings", style={'color': TEXT_SEC, 'fontSize': '12px'})
+            ]),
+            html.Div(style={**CARD, 'textAlign': 'center', 'flex': '1', 'minWidth': '150px',
+                            'borderTop': f'3px solid {ACC_PURP}', 'marginBottom': '0'}, children=[
+                html.Div(peak_day, style={'fontSize': '28px', 'color': ACC_PURP, 'fontWeight': '300'}),
+                html.Div("Busiest Day Ahead", style={'color': TEXT_SEC, 'fontSize': '12px'})
+            ]),
+        ]),
+        html.Div(style=CARD, children=[dcc.Graph(figure=fig_hourly)]),
+        html.Div(style=CARD, children=[dcc.Graph(figure=fig_weekly)]),
+        html.Div(style=CARD, children=[
+            html.H3("⚠ Peak Hour Warnings", style={'color': ACC_AMBER, 'fontWeight': '400', 'marginTop': '0'}),
+            html.Div(warning_cards) if warning_cards else
+            html.Div("No critical delays forecast in this period.", style={'color': ACC_GREEN, 'fontSize': '14px'})
+        ]),
+        html.Div(f"Generated at {data['generated_at'][:19].replace('T', ' ')} · Weather: {weather}",
+                 style={'color': TEXT_SEC, 'fontSize': '11px', 'textAlign': 'right'})
+    ])
+
 
 @app.callback(
     Output('prediction-results', 'children'),
     Input('predict-btn', 'n_clicks'),
     State('pred-airline', 'value'),
     State('pred-terminal', 'value'),
+    State('pred-weather', 'value'),
     State('pred-day', 'value')
 )
-def predict_delay_callback(n_clicks, airline, terminal, day):
-    """Handle delay prediction"""
-    if n_clicks is None:
+def predict_delay(n_clicks, airline, terminal, weather, day):
+    if not n_clicks:
         raise PreventUpdate
-    
-    # Calculate average delay for this airline
-    if not df_flights.empty:
-        airline_data = df_flights[df_flights['airline'] == airline]
-        avg_delay = airline_data['delay_minutes'].mean() if not airline_data.empty else 15
-    else:
-        avg_delay = 15  # Default
-    
-    # Add some randomness for demo
-    np.random.seed(hash(f"{airline}{terminal}{day}") % 1000)
-    predicted_delay = avg_delay + np.random.uniform(-5, 10)
-    predicted_delay = max(0, predicted_delay)
-    
-    # Determine risk
-    if predicted_delay < 15:
-        risk = "LOW"
-        color = "#27ae60"
-        recommendation = "Normal operations"
-    elif predicted_delay < 30:
-        risk = "MEDIUM"
-        color = "#f39c12"
-        recommendation = "Monitor closely, prepare for minor delays"
-    else:
-        risk = "HIGH"
-        color = "#e74c3c"
-        recommendation = "Consider schedule adjustment, notify passengers"
-    
-    # Create gauge chart
-    gauge_fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=predicted_delay,
-        title={"text": "Predicted Delay (minutes)"},
-        gauge={
-            'axis': {'range': [0, 60]},
-            'bar': {'color': color},
-            'steps': [
-                {'range': [0, 15], 'color': "#d5f4e6"},
-                {'range': [15, 30], 'color': "#fef5e7"},
-                {'range': [30, 60], 'color': "#fdeaea"}
-            ],
-            'threshold': {
-                'line': {'color': "black", 'width': 4},
-                'thickness': 0.75,
-                'value': predicted_delay
-            }
-        }
+
+    try:
+        response = httpx.post(f"{API_URL}/predict", json={
+            "airline": airline, "terminal": terminal,
+            "weather": weather, "day": day, "hour": datetime.now().hour
+        }, timeout=10)
+        data              = response.json()
+        predicted_delay   = data["predicted_delay"]
+        delay_probability = data["delay_probability"]
+        risk              = data["risk_level"]
+        rec               = data["recommendation"]
+        model_used        = f"FastAPI — {data['model_used']}"
+        shap_data         = data["shap_explanation"]
+    except Exception as ex:
+        hour       = datetime.now().hour
+        is_peak    = 1 if hour in range(7, 10) or hour in range(17, 20) else 0
+        is_weekend = 1 if day in ['Saturday', 'Sunday'] else 0
+        a_enc = w_enc = t_enc = 0
+        if delay_model and le_airline and le_weather and le_terminal:
+            try:
+                a_enc = le_airline.transform([airline])[0]   if airline  in le_airline.classes_  else 0
+                w_enc = le_weather.transform([weather])[0]   if weather  in le_weather.classes_  else 0
+                t_enc = le_terminal.transform([terminal])[0] if terminal in le_terminal.classes_ else 0
+                predicted_delay = float(delay_model.predict(
+                    np.array([[a_enc, w_enc, t_enc, hour, is_peak, is_weekend]]))[0])
+            except:
+                predicted_delay = 20.0
+        else:
+            airline_data    = df_flights[df_flights['airline'] == airline] if not df_flights.empty else pd.DataFrame()
+            avg_d           = airline_data['delay_minutes'].mean() if not airline_data.empty else 20
+            weather_add     = {'Clear': 0, 'Cloudy': 5, 'Rain': 15, 'Storm': 30}.get(weather, 0)
+            predicted_delay = max(0, avg_d * 0.6 + weather_add +
+                                 (15 if terminal == "T3" else 5) +
+                                 (10 if day in ['Saturday', 'Sunday'] else 0))
+        predicted_delay   = max(0, predicted_delay)
+        delay_probability = min(100, (predicted_delay / 90) * 100)
+        model_used        = f"Local fallback (API error: {ex})"
+        shap_data         = []
+        if predicted_delay < 15:   risk, rec = "LOW",    "Normal operations"
+        elif predicted_delay < 30: risk, rec = "MEDIUM", "Monitor closely"
+        else:                      risk, rec = "HIGH",   "Consider schedule adjustment"
+
+    color = ACC_GREEN if risk == "LOW" else ACC_AMBER if risk == "MEDIUM" else ACC_RED
+
+    shap_section = html.Div()
+    if shap_data:
+        shap_rows = [
+            html.Div(style={
+                'display': 'flex', 'justifyContent': 'space-between',
+                'alignItems': 'center', 'padding': '10px 0',
+                'borderBottom': f'1px solid {BORDER}'
+            }, children=[
+                html.Span(item['feature'], style={'color': TEXT_SEC, 'fontSize': '13px'}),
+                html.Span(f"{'▲' if item['impact'] > 0 else '▼'} {abs(item['impact']):.1f} min",
+                          style={'color': ACC_RED if item['impact'] > 0 else ACC_GREEN,
+                                 'fontWeight': '600', 'fontSize': '14px'}),
+                html.Span(item['direction'], style={'color': TEXT_SEC, 'fontSize': '11px'})
+            ]) for item in shap_data[:4]
+        ]
+        shap_section = html.Div(style=CARD, children=[
+            html.H3("🔍 Why this prediction?",
+                    style={'color': TEXT_HEAD, 'fontWeight': '400', 'marginTop': '0'}),
+            html.P("SHAP explainability — top factors contributing to this delay:",
+                   style={'color': TEXT_SEC, 'fontSize': '13px', 'marginBottom': '16px'}),
+            html.Div(shap_rows)
+        ])
+
+    high_alert = html.Div()
+    if risk == "HIGH":
+        high_alert = html.Div(className='alert-pulse', style={
+            'backgroundColor': ACC_RED, 'color': TEXT_HEAD, 'padding': '12px 20px',
+            'borderRadius': '6px', 'marginBottom': '16px', 'fontWeight': '600'
+        }, children=f"🚨 HIGH DELAY RISK — {airline} on {terminal} — Immediate action recommended")
+
+    gauge = go.Figure(go.Indicator(
+        mode="gauge+number", value=predicted_delay,
+        title={"text": "Predicted Delay (min)", "font": {"color": TEXT_PRI}},
+        number={"font": {"color": color}},
+        gauge={'axis': {'range': [0, 120], 'tickcolor': TEXT_SEC},
+               'bar': {'color': color}, 'bgcolor': BG_PANEL, 'bordercolor': BORDER,
+               'steps': [{'range': [0,  15], 'color': '#1a2e20'},
+                         {'range': [15, 30], 'color': '#2e2510'},
+                         {'range': [30,120], 'color': '#2e1010'}]}
     ))
-    
-    gauge_fig.update_layout(height=300)
-    
+    gauge.update_layout(height=280, paper_bgcolor=BG_CARD, font_color=TEXT_PRI)
+
+    prob_gauge = go.Figure(go.Indicator(
+        mode="gauge+number", value=delay_probability,
+        title={"text": "Delay Probability (%)", "font": {"color": TEXT_PRI}},
+        number={"suffix": "%", "font": {"color": color}},
+        gauge={'axis': {'range': [0, 100], 'tickcolor': TEXT_SEC},
+               'bar': {'color': color}, 'bgcolor': BG_PANEL, 'bordercolor': BORDER,
+               'steps': [{'range': [0,  30], 'color': '#1a2e20'},
+                         {'range': [30, 60], 'color': '#2e2510'},
+                         {'range': [60,100], 'color': '#2e1010'}]}
+    ))
+    prob_gauge.update_layout(height=280, paper_bgcolor=BG_CARD, font_color=TEXT_PRI)
+
     return html.Div([
-        html.Div([
-            html.H3("Prediction Results", style={'textAlign': 'center'}),
-            
-            html.Div([
-                html.Div([
-                    html.H4("📊 Prediction", style={'color': '#3498db'}),
-                    html.H2(f"{predicted_delay:.1f} minutes", 
-                           style={'fontSize': '36px', 'color': color}),
-                    html.P(f"Risk Level: {risk}", 
-                          style={'fontWeight': 'bold', 'color': color})
-                ], style={'textAlign': 'center', 'padding': '20px', 'flex': '1'}),
-                
-                html.Div([
-                    html.H4("💡 Recommendation"),
-                    html.P(recommendation, style={'fontSize': '16px'}),
-                    html.Hr(),
-                    html.P("Factors considered:"),
+        high_alert,
+        html.Div(style=CARD, children=[
+            html.H3("Prediction Results", style={'color': TEXT_HEAD, 'fontWeight': '400', 'marginTop': '0'}),
+            html.Div(f"Model: {model_used}",
+                     style={'color': TEXT_SEC, 'fontSize': '12px', 'marginBottom': '16px'}),
+            html.Div(style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap'}, children=[
+                html.Div(style={'flex': '1', 'minWidth': '260px'}, children=[dcc.Graph(figure=gauge)]),
+                html.Div(style={'flex': '1', 'minWidth': '260px'}, children=[dcc.Graph(figure=prob_gauge)]),
+                html.Div(style={**PANEL, 'flex': '1', 'minWidth': '200px'}, children=[
+                    html.Div("Risk Level", style={'color': TEXT_SEC, 'fontSize': '12px', 'marginBottom': '4px'}),
+                    html.Div(risk, style={'color': color, 'fontSize': '28px',
+                                         'fontWeight': '300', 'marginBottom': '12px'}),
+                    html.Div("Recommendation", style={'color': TEXT_SEC, 'fontSize': '12px', 'marginBottom': '4px'}),
+                    html.Div(rec, style={'color': TEXT_HEAD, 'marginBottom': '16px'}),
+                    html.Div("Inputs", style={'color': TEXT_SEC, 'fontSize': '12px', 'marginBottom': '4px'}),
                     html.Ul([
-                        html.Li(f"Airline: {airline}"),
-                        html.Li(f"Terminal: {terminal}"),
-                        html.Li(f"Day: {day}")
-                    ])
-                ], style={'padding': '20px', 'flex': '2', 'backgroundColor': '#f8f9fa', 
-                         'borderRadius': '10px'})
-            ], style={'display': 'flex', 'gap': '30px', 'margin': '20px 0'}),
-            
-            dcc.Graph(figure=gauge_fig)
-        ], style={'padding': '30px', 'backgroundColor': 'white', 'borderRadius': '10px',
-                 'boxShadow': '0 2px 5px rgba(0,0,0,0.05)'})
+                        html.Li(f"Airline: {airline}",   style={'color': TEXT_PRI}),
+                        html.Li(f"Terminal: {terminal}", style={'color': TEXT_PRI}),
+                        html.Li(f"Weather: {weather}",   style={'color': TEXT_PRI}),
+                        html.Li(f"Day: {day}",           style={'color': TEXT_PRI}),
+                    ], style={'margin': '0', 'paddingLeft': '18px'})
+                ])
+            ])
+        ]),
+        shap_section
     ])
+
 
 @app.callback(
     Output('risk-calculation-result', 'children'),
@@ -1035,158 +929,78 @@ def predict_delay_callback(n_clicks, airline, terminal, day):
     State('risk-hour', 'value'),
     State('risk-weather', 'value')
 )
-def calculate_risk_callback(n_clicks, terminal, hour, weather):
-    """Calculate and display risk score"""
-    if n_clicks is None:
+def calculate_risk(n_clicks, terminal, hour, weather):
+    if not n_clicks:
         raise PreventUpdate
-    
-    risk_score = risk_ai.calculate_risk_score(terminal, hour, weather)
-    
-    if risk_score < 40:
-        level = "LOW"
-        color = "#27ae60"
-        icon = "✅"
-    elif risk_score < 70:
-        level = "MEDIUM"
-        color = "#f39c12"
-        icon = "⚠️"
-    else:
-        level = "HIGH"
-        color = "#e74c3c"
-        icon = "🚨"
-    
+
+    score = risk_ai.calculate_risk_score(terminal, hour, weather)
+
+    if score < 40:   level, color, icon = "LOW",    ACC_GREEN, "●"
+    elif score < 70: level, color, icon = "MEDIUM", ACC_AMBER, "◉"
+    else:            level, color, icon = "HIGH",   ACC_RED,   "⬤"
+
+    high_alert = html.Div()
+    if score >= 70:
+        high_alert = html.Div(className='alert-pulse', style={
+            'backgroundColor': ACC_RED, 'color': TEXT_HEAD, 'padding': '12px 20px',
+            'borderRadius': '6px', 'marginBottom': '16px', 'fontWeight': '600'
+        }, children=f"🚨 HIGH RISK on {terminal} — Score: {score:.0f}/100 — Activate contingency plan")
+
+    extra_alerts = []
+    if alert_system:
+        alerts = alert_system.check_all_alerts(df_flights, passenger_ai.data, weather)
+        extra_alerts = [
+            html.Div(style={**PANEL, 'borderLeft': f'3px solid {ACC_RED}', 'marginBottom': '8px'}, children=[
+                html.Strong(a['title'], style={'color': TEXT_HEAD}),
+                html.Div(a['message'], style={'color': TEXT_SEC, 'fontSize': '13px'})
+            ]) for a in alerts[:3]
+        ]
+
     return html.Div([
-        html.H3(f"{icon} Risk Assessment Results", style={'textAlign': 'center'}),
-        
-        html.Div([
-            html.Div([
-                html.H2(f"{risk_score:.0f}", style={'fontSize': '72px', 'color': color}),
-                html.P("Risk Score", style={'fontSize': '18px', 'color': '#7f8c8d'})
-            ], style={'textAlign': 'center', 'padding': '30px', 'flex': '1'}),
-            
-            html.Div([
-                html.H4("Details", style={'color': '#2c3e50'}),
-                html.Table([
-                    html.Tr([html.Td("Terminal:"), html.Td(terminal)]),
-                    html.Tr([html.Td("Time:"), html.Td(f"{hour}:00")]),
-                    html.Tr([html.Td("Weather:"), html.Td(weather)]),
-                    html.Tr([html.Td("Risk Level:"), html.Td(level, style={'color': color, 'fontWeight': 'bold'})])
-                ], style={'width': '100%', 'borderSpacing': '10px'})
-            ], style={'padding': '30px', 'flex': '2', 'backgroundColor': '#f8f9fa', 
-                     'borderRadius': '10px'})
-        ], style={'display': 'flex', 'gap': '30px', 'margin': '20px 0', 'alignItems': 'center'}),
-        
-        html.Div([
-            html.H4("🎯 Recommended Actions"),
-            html.Ul([
-                html.Li("Increase monitoring frequency"),
-                html.Li("Prepare backup staff if score > 60"),
-                html.Li("Notify airline operations if score > 75"),
-                html.Li("Consider contingency plans if score > 85")
-            ])
-        ], style={'padding': '20px', 'backgroundColor': '#fef5e7', 'borderRadius': '10px'})
+        high_alert,
+        html.Div(style=CARD, children=[
+            html.Div(style={'display': 'flex', 'gap': '24px', 'alignItems': 'center', 'flexWrap': 'wrap'},
+                     children=[
+                html.Div(style={'textAlign': 'center', 'minWidth': '140px'}, children=[
+                    html.Div(icon, style={'fontSize': '28px', 'color': color}),
+                    html.Div(f"{score:.0f}", style={'fontSize': '56px', 'color': color,
+                                                    'fontWeight': '200', 'lineHeight': '1'}),
+                    html.Div("Risk Score", style={'color': TEXT_SEC, 'fontSize': '12px', 'marginTop': '4px'})
+                ]),
+                html.Div(style={**PANEL, 'flex': '1', 'minWidth': '200px'}, children=[
+                    html.Table([
+                        html.Tr([
+                            html.Td(k, style={'color': TEXT_SEC, 'paddingRight': '16px', 'paddingBottom': '8px'}),
+                            html.Td(v, style={'color': TEXT_HEAD, 'fontWeight': '500'})
+                        ]) for k, v in [("Terminal", terminal), ("Hour", f"{hour}:00"),
+                                        ("Weather", weather), ("Level", level)]
+                    ])
+                ]),
+                html.Div(style={**PANEL, 'flex': '2', 'minWidth': '200px'}, children=[
+                    html.Div("Recommended Actions",
+                             style={'color': TEXT_SEC, 'fontSize': '12px', 'marginBottom': '10px'}),
+                    html.Ul([
+                        html.Li("Increase monitoring frequency",   style={'color': TEXT_PRI, 'marginBottom': '4px'}),
+                        html.Li("Prepare backup staff if score > 60", style={'color': TEXT_PRI, 'marginBottom': '4px'}),
+                        html.Li("Notify airline operations if score > 75", style={'color': TEXT_PRI, 'marginBottom': '4px'}),
+                        html.Li("Activate contingency plan if score > 85", style={'color': TEXT_PRI})
+                    ], style={'margin': '0', 'paddingLeft': '18px'})
+                ])
+            ]),
+            html.Div(extra_alerts, style={'marginTop': '20px'}) if extra_alerts else html.Div()
+        ])
     ])
-# Add this function to your app_aoip.py, right after ML initialization
-def enhance_ml_integration():
-    """Connect real ML model with proper feature engineering"""
-    
-    def get_enhanced_prediction(airline, terminal, day, hour=None, weather="Clear"):
-        """
-        Get prediction using actual ML model with feature engineering
-        """
-        try:
-            if model is None:
-                return get_statistical_prediction(airline)
-            
-            # Prepare features based on your model's training
-            input_features = {
-                'airline': airline,
-                'terminal': terminal,
-                'day_of_week': day,
-                'weather': weather,
-                'departure_hour': hour if hour else 12,  # Default to noon
-                'month': datetime.now().month,
-                'day_of_month': datetime.now().day
-            }
-            
-            # Convert to DataFrame
-            input_df = pd.DataFrame([input_features])
-            
-            # Make prediction
-            prediction = model.predict(input_df)[0]
-            return float(prediction)
-            
-        except Exception as e:
-            print(f"Enhanced prediction failed: {e}")
-            # Fallback to statistical method
-            return get_statistical_prediction(airline)
-    
-    def get_statistical_prediction(airline):
-        """Statistical fallback if ML fails"""
-        if not df_flights.empty and airline in df_flights['airline'].values:
-            airline_data = df_flights[df_flights['airline'] == airline]
-            return float(airline_data['delay_minutes'].mean())
-        return 15.0  # Default
-    
-    return get_enhanced_prediction
-# Import alert system
-from alerts import AOIPAlertSystem
 
-# Initialize alert system
-alert_system = AOIPAlertSystem()
 
-# Add alert display to home layout
-def home_layout():
-    # ... existing code ...
-    
-    # Add alerts section
-    alerts = alert_system.check_all_alerts(
-        df_flights if not df_flights.empty else pd.DataFrame(),
-        passenger_ai.data,
-        weather="Clear"
-    )
-    
-    alerts_section = html.Div([
-        html.H3("🚨 Active Alerts", style={'color': '#e74c3c'}),
-        
-        html.Div([
-            html.Div([
-                html.H4(alert['title'], style={'color': '#e74c3c' if alert['priority'] == 'CRITICAL' else 
-                                               '#f39c12' if alert['priority'] == 'HIGH' else '#3498db'}),
-                html.P(alert['message']),
-                html.P(alert['details'], style={'fontSize': '14px', 'color': '#7f8c8d'}),
-                html.Hr(),
-                html.P("Recommended Actions:"),
-                html.Ul([html.Li(action) for action in alert['actions'][:2]])
-            ], style={
-                'padding': '15px',
-                'margin': '10px 0',
-                'backgroundColor': '#fdeaea' if alert['priority'] == 'CRITICAL' else 
-                                  '#fef5e7' if alert['priority'] == 'HIGH' else '#e8f6f3',
-                'borderRadius': '8px',
-                'borderLeft': '4px solid #e74c3c' if alert['priority'] == 'CRITICAL' else 
-                             '4px solid #f39c12' if alert['priority'] == 'HIGH' else '4px solid #3498db'
-            }) for alert in alerts[:3]  # Show top 3 alerts
-        ]) if alerts else html.P("✅ No active alerts - Operations normal")
-    ])
-    
-    # Insert this alerts_section in your home layout
-# Initialize enhanced predictor
-get_prediction = enhance_ml_integration()
 # =========================
-# =========================
-# =========================
-# RUN THE APPLICATION
+# RUN
 # =========================
 if __name__ == '__main__':
     print("\n" + "="*50)
     print("🚀 AIRPORT OPERATIONS INTELLIGENCE PLATFORM")
     print("="*50)
     print("📊 Dashboard: http://localhost:8050")
-    print("👥 Passenger Flow: http://localhost:8050/passenger")
-    print("🚪 Gate Optimization: http://localhost:8050/gates")
-    print("⚠️ Risk Management: http://localhost:8050/risk")
-    print("🤖 AI Prediction: http://localhost:8050/prediction")
+    print("🔌 API:       http://localhost:8000")
+    print("📖 API Docs:  http://localhost:8000/docs")
     print("="*50 + "\n")
-    
     app.run_server(host='0.0.0.0', port=8050, debug=False)

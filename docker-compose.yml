@@ -1,21 +1,20 @@
-# docker-compose.yml
 version: '3.8'
 
 services:
-  aoip:
+  api:
     build: .
+    container_name: smart-airport-api
+    command: uvicorn api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+
+  dashboard:
+    build: .
+    container_name: smart-airport-aoip-1
+    command: python app_aoip.py
     ports:
       - "8050:8050"
+    depends_on:
+      - api
     environment:
-      - PYTHONUNBUFFERED=1
-      - ENVIRONMENT=production
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8050')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      - API_URL=http://api:8000

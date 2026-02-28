@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 RUN useradd -m -u 1000 aoipuser
+RUN mkdir -p /app/model && chmod 777 /app/model
 USER aoipuser
 
 EXPOSE 8050
