@@ -1,3 +1,4 @@
+import time
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import joblib
@@ -5,6 +6,12 @@ import numpy as np
 import pandas as pd
 import os
 from datetime import datetime
+
+from aoip_logger import log_prediction, log_forecast, log_risk, log_error
+from database   import (save_prediction, get_predictions, get_prediction_stats,
+                         get_predictions_by_airline, get_predictions_by_hour,
+                         save_risk_event, get_risk_events,
+                         save_forecast_run)
 
 app = FastAPI(
     title="AOIP ML API",
@@ -33,7 +40,21 @@ except Exception as e:
     print(f"⚠ Weather model not loaded: {e}")
 
 try:
-    df_flights = pd.read_csv("data/processed/flights_clean.csv")
+    risk_model      = joblib.load("model/risk_model.pkl")
+    risk_features   = joblib.load("model/risk_features.pkl")
+    risk_le_terminal= joblib.load("model/risk_le_terminal.pkl")
+    risk_le_airline = joblib.load("model/risk_le_airline.pkl")
+    import json as _json
+    with open("model/risk_model_metadata.json") as _f:
+        risk_metadata = _json.load(_f)
+    print(f"✓ ML Risk model loaded — CV F1: {risk_metadata.get('cv_f1_mean','?')}")
+except Exception as e:
+    risk_model = risk_features = risk_le_terminal = risk_le_airline = None
+    risk_metadata = {}
+    print(f"⚠ Risk ML model not found (will use statistical fallback): {e}")
+
+try:
+    df_flights = pd.read_csv("Data/processed/flights_clean.csv")
     df_flights.columns = df_flights.columns.str.lower().str.strip()
     print(f"✓ Loaded {len(df_flights)} flight records for forecasting")
 except:
@@ -60,14 +81,18 @@ class PredictionResponse(BaseModel):
     shap_explanation:  list
 
 class RiskRequest(BaseModel):
-    terminal: str
-    hour:     int
-    weather:  str
+    terminal:   str
+    hour:       int
+    weather:    str
+    airline:    str = "TunisAir"
+    day_of_week:int = 2
 
 class RiskResponse(BaseModel):
-    risk_score: float
-    risk_level: str
-    factors:    dict
+    risk_score:      float
+    risk_level:      str
+    factors:         dict
+    model_used:      str
+    shap_explanation:list
 
 class ForecastRequest(BaseModel):
     weather:     str = "Clear"
@@ -75,7 +100,7 @@ class ForecastRequest(BaseModel):
 
 
 # =========================
-# HEALTH CHECK
+# HEALTH
 # =========================
 @app.get("/")
 def root():
@@ -95,10 +120,11 @@ def health():
 
 
 # =========================
-# PREDICTION ENDPOINT
+# PREDICTION
 # =========================
 @app.post("/predict", response_model=PredictionResponse)
 def predict(req: PredictionRequest):
+    t_start    = time.time()
     hour       = req.hour if req.hour is not None else datetime.now().hour
     is_peak    = 1 if hour in range(7, 10) or hour in range(17, 20) else 0
     is_weekend = 1 if req.day in ['Saturday', 'Sunday'] else 0
@@ -116,6 +142,7 @@ def predict(req: PredictionRequest):
             predicted_delay = float(delay_model.predict(features)[0])
             model_used      = "random_forest"
         except Exception as e:
+            log_error("prediction", e, {"airline": req.airline})
             raise HTTPException(status_code=500, detail=f"Model error: {e}")
 
     predicted_delay   = max(0, predicted_delay)
@@ -155,6 +182,24 @@ def predict(req: PredictionRequest):
         except:
             pass
 
+    duration_ms = round((time.time() - t_start) * 1000, 1)
+
+    # ── Persist to DB & log ───────────────────────────────────
+    try:
+        save_prediction(
+            req.airline, req.terminal, req.weather, req.day, hour,
+            round(predicted_delay, 1), round(delay_probability, 1),
+            risk_level, recommendation, model_used, shap_explanation
+        )
+    except Exception as e:
+        log_error("db_save_prediction", e)
+
+    log_prediction(
+        req.airline, req.terminal, req.weather, req.day, hour,
+        round(predicted_delay, 1), round(delay_probability, 1),
+        risk_level, model_used, duration_ms
+    )
+
     return PredictionResponse(
         predicted_delay   = round(predicted_delay, 1),
         delay_probability = round(delay_probability, 1),
@@ -166,48 +211,147 @@ def predict(req: PredictionRequest):
 
 
 # =========================
-# RISK ENDPOINT
+# RISK
 # =========================
 @app.post("/risk", response_model=RiskResponse)
 def calculate_risk(req: RiskRequest):
-    weather_factor = {'Clear': 20, 'Cloudy': 40, 'Rain': 65, 'Storm': 85}.get(req.weather, 40)
-    peak_factor    = 70 if req.hour in range(7, 10) or req.hour in range(17, 20) else 30
-    weekend_factor = 40 if datetime.now().weekday() >= 5 else 20
-    delay_factor   = 30
+    t_start     = time.time()
+    is_peak     = 1 if req.hour in range(7,10) or req.hour in range(17,20) else 0
+    is_night    = 1 if req.hour < 6 or req.hour > 22 else 0
+    is_weekend  = 1 if req.day_of_week in [5, 6] else 0
+    weather_enc = {'Clear':0,'Cloudy':1,'Rain':2,'Storm':3}.get(req.weather, 0)
+    flight_len  = 120
 
-    score = min(
-        delay_factor   * 0.40 +
-        peak_factor    * 0.25 +
-        weather_factor * 0.25 +
-        weekend_factor * 0.10,
-        100
-    )
+    # ── Try ML model first ─────────────────────────────────
+    model_used      = "statistical_fallback"
+    risk_level      = "MEDIUM"
+    score           = 50.0
+    shap_explanation= []
 
-    if score < 40:   risk_level = "LOW"
-    elif score < 70: risk_level = "MEDIUM"
-    else:            risk_level = "HIGH"
+    if risk_model is not None:
+        try:
+            # Encode terminal
+            if risk_le_terminal and req.terminal in risk_le_terminal.classes_:
+                t_enc = int(risk_le_terminal.transform([req.terminal])[0])
+            else:
+                t_enc = 0
+
+            # Encode airline
+            if risk_le_airline and req.airline in risk_le_airline.classes_:
+                a_enc = int(risk_le_airline.transform([req.airline])[0])
+            else:
+                a_enc = 0
+
+            features_vec = np.array([[
+                a_enc, t_enc, weather_enc,
+                req.hour, is_peak, is_night,
+                is_weekend, req.day_of_week, flight_len
+            ]])
+
+            # Predict class and probability
+            proba       = risk_model.predict_proba(features_vec)[0]
+            classes     = risk_model.classes_
+            pred_class  = classes[np.argmax(proba)]
+            risk_level  = str(pred_class)
+
+            # Score = weighted probability (LOW=20, MEDIUM=55, HIGH=90)
+            w_map = {'LOW': 20, 'MEDIUM': 55, 'HIGH': 90}
+            score = sum(w_map.get(c, 50) * p for c, p in zip(classes, proba))
+            model_used = f"RandomForest (CV F1={risk_metadata.get('cv_f1_mean','?')})"
+
+            # SHAP explanation
+            try:
+                import shap
+                explainer   = shap.TreeExplainer(risk_model)
+                shap_vals   = explainer.shap_values(features_vec)
+                feat_names  = risk_features if risk_features else [
+                    'airline','terminal','weather','hour',
+                    'is_peak','is_night','is_weekend','dow','flight_length'
+                ]
+                # shap_vals for predicted class
+                cls_idx = list(classes).index(risk_level)
+                sv      = shap_vals[cls_idx][0] if isinstance(shap_vals, list) else shap_vals[0]
+                for name, val in sorted(zip(feat_names, sv), key=lambda x: -abs(x[1])):
+                    shap_explanation.append({
+                        "feature":   name,
+                        "impact":    round(float(val), 3),
+                        "direction": "increases risk" if val > 0 else "reduces risk"
+                    })
+            except Exception as se:
+                log_error("shap_risk", se)
+
+        except Exception as me:
+            log_error("ml_risk", me)
+            # Fallback to statistical
+            weather_factor = {'Clear':20,'Cloudy':40,'Rain':65,'Storm':85}.get(req.weather,40)
+            peak_factor    = 70 if is_peak else 30
+            weekend_factor = 40 if is_weekend else 20
+            score          = min(30*0.40 + peak_factor*0.25 + weather_factor*0.25 + weekend_factor*0.10, 100)
+            risk_level     = "LOW" if score < 40 else "MEDIUM" if score < 70 else "HIGH"
+            model_used     = "statistical_fallback"
+    else:
+        # Pure statistical fallback
+        weather_factor = {'Clear':20,'Cloudy':40,'Rain':65,'Storm':85}.get(req.weather,40)
+        peak_factor    = 70 if is_peak else 30
+        weekend_factor = 40 if is_weekend else 20
+        score          = min(30*0.40 + peak_factor*0.25 + weather_factor*0.25 + weekend_factor*0.10, 100)
+        risk_level     = "LOW" if score < 40 else "MEDIUM" if score < 70 else "HIGH"
+
+    duration_ms = round((time.time() - t_start) * 1000, 1)
+
+    try:
+        save_risk_event(req.terminal, req.hour, req.weather, round(score,1), risk_level)
+    except Exception as e:
+        log_error("db_save_risk", e)
+
+    log_risk(req.terminal, req.hour, req.weather, round(score,1), risk_level, duration_ms)
 
     return RiskResponse(
-        risk_score = round(score, 1),
-        risk_level = risk_level,
-        factors    = {
-            "weather_factor": weather_factor,
-            "peak_factor":    peak_factor,
-            "weekend_factor": weekend_factor,
-            "delay_factor":   delay_factor
+        risk_score       = round(score, 1),
+        risk_level       = risk_level,
+        model_used       = model_used,
+        shap_explanation = shap_explanation[:6],
+        factors          = {
+            "weather":    req.weather,
+            "hour":       req.hour,
+            "is_peak":    bool(is_peak),
+            "is_weekend": bool(is_weekend),
+            "terminal":   req.terminal,
+            "airline":    req.airline,
+            "model":      model_used
         }
     )
 
+@app.get("/risk/model-info")
+def risk_model_info():
+    if risk_metadata:
+        return risk_metadata
+    return {"status": "ML model not trained yet", "fallback": "statistical"}
+
 
 # =========================
-# FORECAST ENDPOINT
+# FORECAST
 # =========================
 @app.post("/forecast")
 def forecast(req: ForecastRequest):
+    t_start = time.time()
     from services.forecasting_service import forecast_delays, forecast_weekly
     hours_ahead = max(1, min(req.hours_ahead, 24))
-    hourly = forecast_delays(df_flights, hours_ahead=hours_ahead, weather=req.weather)
-    weekly = forecast_weekly(df_flights)
+    hourly  = forecast_delays(df_flights, hours_ahead=hours_ahead, weather=req.weather)
+    weekly  = forecast_weekly(df_flights)
+
+    forecast_avg          = round(sum(hourly["forecast"]["values"]) / len(hourly["forecast"]["values"]), 1)
+    forecast_max          = round(max(hourly["forecast"]["values"]), 1)
+    peak_warnings_count   = len(hourly.get("peak_warnings", []))
+    duration_ms           = round((time.time() - t_start) * 1000, 1)
+
+    try:
+        save_forecast_run(req.weather, hours_ahead, forecast_avg, forecast_max, peak_warnings_count)
+    except Exception as e:
+        log_error("db_save_forecast", e)
+
+    log_forecast(req.weather, hours_ahead, forecast_avg, forecast_max, peak_warnings_count, duration_ms)
+
     return {
         "hourly":       hourly,
         "weekly":       weekly,
@@ -216,7 +360,33 @@ def forecast(req: ForecastRequest):
 
 
 # =========================
-# INFO ENDPOINTS
+# HISTORY ENDPOINTS
+# =========================
+@app.get("/history/predictions")
+def history_predictions(limit: int = 50):
+    """Return last N predictions from database."""
+    return {"predictions": get_predictions(limit)}
+
+@app.get("/history/predictions/stats")
+def prediction_stats():
+    """Aggregate stats across all saved predictions."""
+    return get_prediction_stats()
+
+@app.get("/history/predictions/by-airline")
+def predictions_by_airline():
+    return {"data": get_predictions_by_airline()}
+
+@app.get("/history/predictions/by-hour")
+def predictions_by_hour():
+    return {"data": get_predictions_by_hour()}
+
+@app.get("/history/risk")
+def history_risk(limit: int = 50):
+    return {"events": get_risk_events(limit)}
+
+
+# =========================
+# INFO
 # =========================
 @app.get("/airlines")
 def get_airlines():
@@ -244,3 +414,28 @@ def model_info():
             "classes":      weather_model.classes_.tolist()
         }
     return info
+
+
+# =========================
+# SIMULATION
+# =========================
+class SimulationRequest(BaseModel):
+    terminal:     str = "T1"
+    weather:      str = "Clear"
+    flight_count: int = 10
+    start_hour:   int = 8
+    end_hour:     int = 10
+
+@app.post("/simulate")
+def simulate_scenario(req: SimulationRequest):
+    from scenario_simulator import ScenarioSimulator
+    sim = ScenarioSimulator()
+    result = sim.simulate(
+        terminal     = req.terminal,
+        weather      = req.weather,
+        flight_count = req.flight_count,
+        start_hour   = req.start_hour,
+        end_hour     = req.end_hour,
+        df_flights   = df_flights
+    )
+    return result
