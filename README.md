@@ -30,3 +30,8 @@ The solution provides actionable insights for airport operations teams to optimi
 ```bash
 git clone https://github.com/<your-username>/smart-airport.git
 cd smart-airport
+## 🎥 Demo Video
+
+Watch the Smart Airport AOIP system demo here:
+
+https://youtu.be/7JK46tmL1uQ
