@@ -34,4 +34,6 @@ cd smart-airport
 
 Watch the Smart Airport AOIP system demo here:
 
-https://youtu.be/7JK46tmL1uQ
+## Demo Video
+
+Check out the demo here: https://youtu.be/7JK46tmL1uQ
